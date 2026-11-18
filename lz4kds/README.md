@@ -28,7 +28,7 @@ lz4kds/
 │   └── lz4kd_*.c          LZ4KD 编解码（华为，BSD-3-Clause/GPL-2.0）
 ├── include/        新增头文件
 ├── scripts/        lz4kds_inject.py
-├── test/           用户态算法测试
+├── test/           用户态测试（链接真实 src/lz4kds_sddc.c）
 ├── ci/             独立 CI 配置
 ├── README.md
 └── ARCHIVE.md      移植存档

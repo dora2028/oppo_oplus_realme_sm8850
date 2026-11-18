@@ -101,22 +101,6 @@ static int lz4kds_decompress(struct zcomp_params *params, struct zcomp_ctx *ctx,
 	return 0;
 }
 
-/*
- * Optional hook used by the patch in this repository: called from
- * zram_free_page() while the object is still mapped.  References are
- * immortal, so this only updates the usage counter.
- */
-static void lz4kds_release(struct zcomp_params *params, const void *src,
-			   unsigned int src_len)
-{
-	struct lz4kds_sddc *sddc = params->drv_data;
-
-	if (!sddc || !src || !src_len)
-		return;
-
-	lz4kds_sddc_put_payload(sddc, src, src_len);
-}
-
 const struct zcomp_ops backend_lz4kds = {
 	.compress	= lz4kds_compress,
 	.decompress	= lz4kds_decompress,
@@ -124,6 +108,5 @@ const struct zcomp_ops backend_lz4kds = {
 	.destroy_ctx	= lz4kds_destroy_ctx,
 	.setup_params	= lz4kds_setup_params,
 	.release_params	= lz4kds_release_params,
-	.lz4kds_release	= lz4kds_release,
 	.name		= "lz4kds",
 };

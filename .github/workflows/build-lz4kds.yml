@@ -33,19 +33,49 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 用户态算法测试（alias / delta / 普通 / 原始 往返 + 压测）
+      - name: 用户态算法测试（链接真实 lz4kds_sddc.c）
         run: |
           set -e
+          # Links src/lz4kds_sddc.c itself.  The old test re-implemented the
+          # SDDC logic locally, so a PASS only proved the copy worked.
           gcc -O2 -include lz4kds/test/kshim.h \
-              -I lz4kds/include -I lz4kds/src \
-              -o /tmp/sddc_test \
-              lz4kds/test/sddc_test.c \
+              -I lz4kds/test -I lz4kds/include -I lz4kds/src \
+              -o /tmp/sddc_real_test \
+              lz4kds/test/sddc_real_test.c \
+              lz4kds/src/lz4kds_sddc.c \
               lz4kds/src/lz4kd_encode.c \
               lz4kds/src/lz4kd_encode_delta.c \
               lz4kds/src/lz4kd_decode.c \
               lz4kds/src/lz4kd_decode_delta.c
-          /tmp/sddc_test | tee /tmp/sddc_test.log
-          grep -q 'RESULT: PASS' /tmp/sddc_test.log
+          /tmp/sddc_real_test | tee /tmp/sddc_real_test.log
+          grep -q 'RESULT: PASS' /tmp/sddc_real_test.log
+
+      - name: 边界测试（引用表耗尽 / 不可压缩页）
+        run: |
+          set -e
+          # Reference-table exhaustion: past LZ4KDS_REF_MAX every page must
+          # still round-trip via the ordinary path with no dangling id.
+          gcc -O2 -include lz4kds/test/kshim.h \
+              -I lz4kds/test -I lz4kds/include -I lz4kds/src \
+              -o /tmp/t_exhaust \
+              lz4kds/test/exhaust_test.c \
+              lz4kds/src/lz4kds_sddc.c \
+              lz4kds/src/lz4kd_encode.c lz4kds/src/lz4kd_encode_delta.c \
+              lz4kds/src/lz4kd_decode.c lz4kds/src/lz4kd_decode_delta.c
+          /tmp/t_exhaust | tee /tmp/t_exhaust.log
+          grep -q 'RESULT: PASS' /tmp/t_exhaust.log
+
+          # Incompressible pages must be reported as PAGE_SIZE and never be
+          # wrapped in a marker (zram stores those verbatim).
+          gcc -O2 -include lz4kds/test/kshim.h \
+              -I lz4kds/test -I lz4kds/include -I lz4kds/src \
+              -o /tmp/t_random \
+              lz4kds/test/random_test.c \
+              lz4kds/src/lz4kds_sddc.c \
+              lz4kds/src/lz4kd_encode.c lz4kds/src/lz4kd_encode_delta.c \
+              lz4kds/src/lz4kd_decode.c lz4kds/src/lz4kd_decode_delta.c
+          /tmp/t_random | tee /tmp/t_random.log
+          grep -q 'RESULT: PASS' /tmp/t_random.log
 
   build:
     needs: [host-test]
@@ -57,9 +87,18 @@ jobs:
 
       - name: 安装构建依赖
         run: |
+          set -e
           sudo apt-get update -qq
+          # LLVM=1/LLVM_IAS=1 requires clang and ld.lld on PATH.  Without them
+          # even "make gki_defconfig" aborts with
+          #   scripts/Kconfig.include:41: linker 'ld.lld' not found
+          # so they must be installed here, not discovered at build time.
           sudo apt-get install -y -qq build-essential bison flex bc \
-              libelf-dev libssl-dev python3 wget xz-utils
+              libelf-dev libssl-dev python3 wget xz-utils \
+              clang lld llvm
+          echo "=== toolchain ==="
+          clang --version | head -n 1
+          ld.lld --version | head -n 1
 
       - name: 获取 AOSP common 内核源码
         run: |
@@ -105,6 +144,9 @@ jobs:
           export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
           export CROSS_COMPILE=aarch64-linux-gnu-
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error"
+          # Fail fast with a readable message instead of a kconfig abort.
+          command -v clang  || { echo "错误：clang 未安装"; exit 1; }
+          command -v ld.lld || { echo "错误：ld.lld 未安装"; exit 1; }
           make -j"$(nproc)" gki_defconfig
           make -j"$(nproc)" drivers/block/zram/
           ls -la drivers/block/zram/*.o

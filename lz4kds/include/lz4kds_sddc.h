@@ -74,10 +74,6 @@ int lz4kds_sddc_compress(struct lz4kds_sddc *sddc, struct lz4kds_codec *codec,
 int lz4kds_sddc_decompress(struct lz4kds_sddc *sddc, struct lz4kds_codec *codec,
 			   const void *src, unsigned int src_len, void *dst);
 
-/* Drop the reference owned by a payload that is about to be freed. */
-void lz4kds_sddc_put_payload(struct lz4kds_sddc *sddc, const void *src,
-			     unsigned int src_len);
-
 void lz4kds_sddc_get_stats(struct lz4kds_sddc *sddc, struct lz4kds_stats *out);
 
 #endif /* _LZ4KDS_SDDC_H */

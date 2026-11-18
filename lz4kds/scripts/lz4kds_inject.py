@@ -56,6 +56,29 @@ COPY_MAP = [
     ("include/lz4kd.h", "include/linux/lz4kd.h"),
 ]
 
+# Codec objects shipped by the repo.  When the tree already provides them via
+# the upstream lz4kd.patch (lib/lz4kd/), compiling these again would define
+# lz4kd_encode()/lz4kd_decode()/... twice and fail at link time, so the copies
+# are skipped and the upstream objects are used instead.
+CODEC_OBJECTS = [
+    "lz4kd_encode.o",
+    "lz4kd_encode_delta.o",
+    "lz4kd_decode.o",
+    "lz4kd_decode_delta.o",
+]
+
+# Relative to the kernel tree root.
+UPSTREAM_CODEC_DIR = "lib/lz4kd"
+
+# Source basenames corresponding to CODEC_OBJECTS.
+CODEC_OBJECTS_SRC = set(o[:-2] + ".c" for o in CODEC_OBJECTS)
+
+
+def upstream_codec_present(root):
+    """True when the tree already builds the LZ4KD codec itself."""
+    probe = os.path.join(root, UPSTREAM_CODEC_DIR, "lz4kd_encode.c")
+    return os.path.isfile(probe)
+
 # Generated file, not copied from the repo.
 DECL_HEADER = "drivers/block/zram/lz4kds_backend_decl.h"
 DECL_BODY = """/* SPDX-License-Identifier: GPL-2.0-or-later */
@@ -114,15 +137,25 @@ def restore_file(root, rel):
 # ---------------------------------------------------------------- inject ----
 
 def copy_sources(root, repo):
+    upstream = upstream_codec_present(root)
+    n = 0
     for src_rel, dst_rel in COPY_MAP:
+        # Skip the bundled codec sources when the tree already has them; the
+        # header include/linux/lz4kd.h is still installed because the SDDC
+        # layer needs the codec API declarations.
+        base = os.path.basename(dst_rel)
+        if upstream and base in CODEC_OBJECTS_SRC and \
+                "/lib/" not in dst_rel and dst_rel.startswith("drivers/"):
+            continue
         src = os.path.join(repo, src_rel)
         if not os.path.isfile(src):
             die("missing in repo: " + src_rel)
         dst = os.path.join(root, dst_rel)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copyfile(src, dst)
+        n += 1
     write(os.path.join(root, DECL_HEADER), DECL_BODY)
-    print("lz4kds: copied %d sources (+1 generated header)" % len(COPY_MAP))
+    print("lz4kds: copied %d sources (+1 generated header)" % n)
 
 
 def wire_makefile(root):
@@ -130,17 +163,27 @@ def wire_makefile(root):
     text = read(path)
     if B in text:
         return False
-    text += "\n".join([
+    upstream = upstream_codec_present(root)
+    lines = [
         "",
         m_begin("make"),
         "zram-$(CONFIG_ZRAM_BACKEND_LZ4KDS)\t+= lz4kds_backend.o lz4kds_sddc.o",
-        "zram-$(CONFIG_ZRAM_BACKEND_LZ4KDS)\t+= lz4kd_encode.o lz4kd_encode_delta.o",
-        "zram-$(CONFIG_ZRAM_BACKEND_LZ4KDS)\t+= lz4kd_decode.o lz4kd_decode_delta.o",
+    ]
+    if not upstream:
+        lines += [
+            "zram-$(CONFIG_ZRAM_BACKEND_LZ4KDS)\t+= lz4kd_encode.o lz4kd_encode_delta.o",
+            "zram-$(CONFIG_ZRAM_BACKEND_LZ4KDS)\t+= lz4kd_decode.o lz4kd_decode_delta.o",
+        ]
+    lines += [
         "ccflags-$(CONFIG_ZRAM_BACKEND_LZ4KDS)\t+= -DLZ4K_DELTA",
         m_end("make"),
         "",
-    ])
+    ]
+    text += "\n".join(lines)
     write(path, text)
+    if upstream:
+        print("lz4kds: %s provides the codec, not compiling the bundled copy"
+              % UPSTREAM_CODEC_DIR)
     return True
 
 
@@ -170,63 +213,34 @@ def wire_zcomp_c(root):
 
 
 def wire_zcomp_h(root):
-    path = os.path.join(root, "drivers/block/zram/zcomp.h")
-    text = read(path)
-    if B in text:
-        return False
-    anchor = "\tvoid (*release_params)(struct zcomp_params *params);\n"
-    if anchor not in text:
-        die("anchor not found in zcomp.h: release_params")
-    block = anchor + "\n".join([
-        m_begin(),
-        "\t/* Called from zram_free_page() while the object is still mapped. */",
-        "\tvoid (*lz4kds_release)(struct zcomp_params *params, const void *src,",
-        "\t\t\t       unsigned int src_len);",
-        m_end(),
-        "",
-    ])
-    write(path, text.replace(anchor, block, 1))
-    return True
+    """Deliberately a no-op.
+
+    The previous revision extended struct zcomp_ops with an lz4kds_release
+    callback so zram_free_page() could notify the backend.  Since references
+    are immortal there is nothing to notify, so the extension is dropped and
+    struct zcomp_ops stays exactly as upstream defines it.
+    """
+    return False
+
 
 
 def wire_zram_drv_c(root):
-    path = os.path.join(root, "drivers/block/zram/zram_drv.c")
-    text = read(path)
-    if B in text:
-        return False
-    old = ("\thandle = zram_get_handle(zram, index);\n"
-           "\tif (!handle)\n"
-           "\t\treturn;\n"
-           "\n"
-           "\tzs_free(zram->mem_pool, handle);\n")
-    if old not in text:
-        die("free-path anchor not found in zram_drv.c")
-    hook = "\n".join([
-        "\thandle = zram_get_handle(zram, index);",
-        "\tif (!handle)",
-        "\t\treturn;",
-        "",
-        m_begin(),
-        "\t{",
-        "\t\tstruct zcomp *lc = zram->comps[ZRAM_PRIMARY_COMP];",
-        "",
-        "\t\tif (lc && lc->ops->lz4kds_release) {",
-        "\t\t\tstruct zcomp_strm *ls = zcomp_stream_get(lc);",
-        "\t\t\tvoid *lp = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);",
-        "",
-        "\t\t\tlc->ops->lz4kds_release(lc->params, lp,",
-        "\t\t\t\t\t\tzram_get_obj_size(zram, index));",
-        "\t\t\tzs_unmap_object(zram->mem_pool, handle);",
-        "\t\t\tzcomp_stream_put(lc);",
-        "\t\t}",
-        "\t}",
-        m_end(),
-        "",
-        "\tzs_free(zram->mem_pool, handle);",
-        "",
-    ])
-    write(path, text.replace(old, hook, 1))
-    return True
+    """Deliberately a no-op.
+
+    References are immortal: an alias/delta payload may already sit on the
+    backing device and only carries a numeric reference id, so freeing a zram
+    slot must never drop a reference.  There is therefore nothing for
+    zram_free_page() to tell the backend.
+
+    An earlier revision did inject a hook there that mapped every object only
+    to decrement an accounting counter nothing ever read.  That ran on the
+    free hot path, under the slot lock, in atomic context (zram_slot_free_
+    notify is called from bio completion), costing a zcomp_stream_get() plus
+    zs_map_object() round trip per freed page for no benefit.  Removing it is
+    part of the latency fix.
+    """
+    return False
+
 
 
 def wire_kconfig(root):
@@ -237,13 +251,16 @@ def wire_kconfig(root):
     anchor = "config ZRAM_BACKEND_ZSTD"
     if anchor not in text:
         die("anchor not found in Kconfig: config ZRAM_BACKEND_ZSTD")
+    upstream = upstream_codec_present(root)
     block = "\n".join([
         m_begin("kconfig"),
         "config ZRAM_BACKEND_LZ4KDS",
         '\tbool "lz4kds (LZ4KD + SDDC) compression support"',
         "\tdepends on ZRAM",
+    ] + ([
         "\tselect LZ4KD_COMPRESS",
         "\tselect LZ4KD_DECOMPRESS",
+    ] if upstream else []) + [
         "\thelp",
         "\t  LZ4KD plus SDDC similarity/delta compression: identical pages are",
         "\t  stored once as an alias, and pages differing in only a few bytes are",

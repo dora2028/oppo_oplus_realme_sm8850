@@ -63,14 +63,43 @@
 #define LZ4KDS_HASH_BITS	12
 #define LZ4KDS_HASH_SIZE	(1u << LZ4KDS_HASH_BITS)
 
+/*
+ * Delta candidate selection
+ * -------------------------
+ * An exact 4 KiB jhash only groups *identical* pages: flipping a single byte
+ * changes the hash completely, so a page that differs from a resident one by
+ * a few bytes lands in a different bucket with overwhelming probability
+ * (measured: 0 of 2000 single-byte variants shared a bucket).  Walking the
+ * exact-hash bucket therefore almost never finds a delta candidate, so the
+ * delta path was dead weight while still costing a full hash plus a bucket
+ * walk on every write.
+ *
+ * Similarity is indexed with several small *windows* spread across the page
+ * instead of one prefix.  A page is registered under the hash of every window,
+ * and a lookup probes each window's bucket.  Two pages that differ in a few
+ * scattered bytes almost always still share at least one untouched window,
+ * which is exactly the property a delta candidate needs; a single prefix hash
+ * fails as soon as any modified byte falls inside that prefix.
+ *
+ * Work per write stays bounded: WINDOWS buckets are probed and at most
+ * LZ4KDS_DELTA_TRIES encodings are attempted, independent of table fullness.
+ */
+#define LZ4KDS_WINDOWS		4
+#define LZ4KDS_FP_SIZE		64
+#define LZ4KDS_WINDOW_STRIDE	(LZ4KDS_BLOCK_SIZE / LZ4KDS_WINDOWS)
+
+#define LZ4KDS_SAMPLE_BITS	8
+#define LZ4KDS_SAMPLE_SIZE	(1u << LZ4KDS_SAMPLE_BITS)
+#define LZ4KDS_SAMPLE_WAYS	2	/* candidates kept per window bucket */
+
 /* Delta candidates tried per write; the encoder runs without locks. */
-#define LZ4KDS_DELTA_TRIES	4
+#define LZ4KDS_DELTA_TRIES	2
 
 struct lz4kds_ref {
-	u32 id;			/* 0 = slot free */
-	u32 hash;
-	s32 hnext;		/* next id in the same hash bucket, 0 = end */
-	atomic_t users;		/* accounting only; never gates freeing */
+	u32 id;				/* 0 = slot free */
+	u32 hash;			/* exact page hash -> alias bucket */
+	u32 whash[LZ4KDS_WINDOWS];	/* per-window hashes -> similarity buckets */
+	s32 hnext;			/* next id in the same alias bucket, 0 = end */
 	u8 *page;
 };
 
@@ -78,6 +107,8 @@ struct lz4kds_sddc {
 	spinlock_t *locks;			/* LZ4KDS_LOCK_STRIPES */
 	struct lz4kds_ref *refs;		/* LZ4KDS_REF_MAX */
 	u32 *buckets;				/* LZ4KDS_HASH_SIZE -> id */
+	u32 *samples;	/* WINDOWS * SAMPLE_SIZE * WAYS candidates */
+	u8 *sample_pos;	/* WINDOWS * SAMPLE_SIZE insert cursors */
 	u32 next_id;
 	atomic_t nr_live;
 	atomic64_t ref_bytes;
@@ -92,6 +123,27 @@ static inline spinlock_t *lz4kds_lock(struct lz4kds_sddc *sddc, u32 v)
 static inline u32 lz4kds_hash_page(const void *p)
 {
 	return jhash(p, LZ4KDS_BLOCK_SIZE, 0x9e3779b9) & (LZ4KDS_HASH_SIZE - 1);
+}
+
+/*
+ * Hash window @i of the page.  Windows are spread across the whole block so a
+ * page that differs in a few scattered bytes still matches on the windows it
+ * did not touch.
+ */
+static inline u32 lz4kds_hash_window(const void *p, unsigned int i)
+{
+	const u8 *b = (const u8 *)p + i * LZ4KDS_WINDOW_STRIDE;
+
+	return jhash(b, LZ4KDS_FP_SIZE, 0x85ebca6b + i) &
+	       (LZ4KDS_SAMPLE_SIZE - 1);
+}
+
+static inline void lz4kds_hash_windows(const void *p, u32 *out)
+{
+	unsigned int i;
+
+	for (i = 0; i < LZ4KDS_WINDOWS; i++)
+		out[i] = lz4kds_hash_window(p, i);
 }
 
 struct lz4kds_codec *lz4kds_codec_create(void)
@@ -147,7 +199,13 @@ struct lz4kds_sddc *lz4kds_sddc_create(void)
 	sddc->refs = kvcalloc(LZ4KDS_REF_MAX, sizeof(*sddc->refs), GFP_KERNEL);
 	sddc->buckets = kvcalloc(LZ4KDS_HASH_SIZE, sizeof(*sddc->buckets),
 				 GFP_KERNEL);
-	if (!sddc->locks || !sddc->refs || !sddc->buckets) {
+	sddc->samples = kvcalloc(LZ4KDS_WINDOWS * LZ4KDS_SAMPLE_SIZE *
+				 LZ4KDS_SAMPLE_WAYS, sizeof(*sddc->samples),
+				 GFP_KERNEL);
+	sddc->sample_pos = kvcalloc(LZ4KDS_WINDOWS * LZ4KDS_SAMPLE_SIZE,
+				    sizeof(*sddc->sample_pos), GFP_KERNEL);
+	if (!sddc->locks || !sddc->refs || !sddc->buckets ||
+	    !sddc->samples || !sddc->sample_pos) {
 		lz4kds_sddc_destroy(sddc);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -175,6 +233,8 @@ void lz4kds_sddc_destroy(struct lz4kds_sddc *sddc)
 		kvfree(sddc->refs);
 	}
 	kvfree(sddc->buckets);
+	kvfree(sddc->samples);
+	kvfree(sddc->sample_pos);
 	kfree(sddc->locks);
 	kfree(sddc);
 }
@@ -210,11 +270,12 @@ static struct lz4kds_ref *lz4kds_ref_find_page(struct lz4kds_sddc *sddc,
 
 /* Publish @page as a new reference.  Returns NULL when the budget is full. */
 static struct lz4kds_ref *lz4kds_ref_publish(struct lz4kds_sddc *sddc,
-					    const void *page, u32 hash)
+					    const void *page, u32 hash,
+					    const u32 *whash)
 {
 	struct lz4kds_ref *ref;
 	spinlock_t *lock;
-	u32 id;
+	u32 id, w;
 
 	if (atomic_read(&sddc->nr_live) >= LZ4KDS_REF_MAX)
 		return NULL;
@@ -222,26 +283,49 @@ static struct lz4kds_ref *lz4kds_ref_publish(struct lz4kds_sddc *sddc,
 	    LZ4KDS_REF_BUDGET)
 		return NULL;
 
-	for (id = sddc->next_id; id < LZ4KDS_REF_MAX; id++)
-		if (!sddc->refs[id].id)
-			break;
-	if (id >= LZ4KDS_REF_MAX)
+	/*
+	 * Ids are handed out in ascending order and never freed, so next_id is
+	 * the first free slot.  There is no need to scan for a hole: refs are
+	 * immortal, which makes allocation O(1) instead of a linear sweep that
+	 * would rescan the tail on every write once the table filled up.
+	 */
+	if (sddc->next_id >= LZ4KDS_REF_MAX)
 		return NULL;
+	id = sddc->next_id;
 
 	ref = &sddc->refs[id];
-	ref->page = kvmalloc(LZ4KDS_BLOCK_SIZE, GFP_ATOMIC);
+	/*
+	 * The page copy is allocated with GFP_ATOMIC because the zram write
+	 * path runs with preemption disabled.  kvzalloc() is used instead of
+	 * kvmalloc(): kvzalloc falls back to vmalloc, while kvmalloc() returns
+	 * NULL outright for non-blocking allocations (see __kvmalloc_node).
+	 * 4 KiB is a single page, so the plain kmalloc path is taken anyway.
+	 */
+	ref->page = kvzalloc(LZ4KDS_BLOCK_SIZE, GFP_ATOMIC);
 	if (!ref->page)
 		return NULL;
 	memcpy(ref->page, page, LZ4KDS_BLOCK_SIZE);
 
+	ref->hash = hash;
+	ref->id = id;
+
 	lock = lz4kds_lock(sddc, hash);
 	spin_lock(lock);
-	ref->hash = hash;
 	ref->hnext = sddc->buckets[hash];
-	ref->id = id;
-	atomic_set(&ref->users, 1);
 	sddc->buckets[hash] = id;
 	spin_unlock(lock);
+
+	/* Register under every window so any untouched window can match later. */
+	for (w = 0; w < LZ4KDS_WINDOWS; w++) {
+		u32 hb = whash[w];
+		u32 idx = w * LZ4KDS_SAMPLE_SIZE + hb;
+		u32 slot = idx * LZ4KDS_SAMPLE_WAYS +
+			   (sddc->sample_pos[idx] % LZ4KDS_SAMPLE_WAYS);
+
+		ref->whash[w] = hb;
+		sddc->samples[slot] = id;
+		sddc->sample_pos[idx]++;
+	}
 
 	sddc->next_id = id + 1;
 	atomic_inc(&sddc->nr_live);
@@ -283,7 +367,6 @@ int lz4kds_sddc_compress(struct lz4kds_sddc *sddc, struct lz4kds_codec *codec,
 	if (ref) {
 		u32 id = ref->id;
 
-		atomic_inc(&ref->users);
 		out[0] = LZ4KDS_KIND_ALIAS;
 		memcpy(out + 1, &id, sizeof(id));
 		*dst_len = LZ4KDS_HDR_REFERENCED;
@@ -294,41 +377,60 @@ int lz4kds_sddc_compress(struct lz4kds_sddc *sddc, struct lz4kds_codec *codec,
 
 	/*
 	 * 3. similar page? -> delta against the best resident reference.
-	 * Candidates come from the same hash bucket, are snapshotted into a
-	 * private buffer, and the encoder runs without any lock.
+	 *
+	 * Candidates come from the prefix-hash sample set, not from the exact
+	 * hash bucket: an exact 4 KiB hash separates pages that differ by a
+	 * single byte, so the alias bucket almost never contains a useful delta
+	 * candidate.  Each candidate page is snapshotted into a private buffer
+	 * before encoding, and the encoder itself runs with no lock held.
 	 */
 	if (atomic_read(&sddc->nr_live)) {
 		unsigned int best = 0;
 		unsigned int tries = 0;
 		u32 best_id = 0;
-		s32 id;
+		u32 whash[LZ4KDS_WINDOWS];
+		u32 w;
 
-		for (id = sddc->buckets[hash];
-		     id > 0 && tries < LZ4KDS_DELTA_TRIES;
-		     id = sddc->refs[id].hnext) {
-			struct lz4kds_ref *cand = &sddc->refs[id];
-			unsigned int dret;
+		lz4kds_hash_windows(src, whash);
 
-			memcpy(codec->window, cand->page, LZ4KDS_BLOCK_SIZE);
-			memcpy(codec->window + LZ4KDS_BLOCK_SIZE, src,
-			       LZ4KDS_BLOCK_SIZE);
+		for (w = 0; w < LZ4KDS_WINDOWS && tries < LZ4KDS_DELTA_TRIES; w++) {
+			u32 base = (w * LZ4KDS_SAMPLE_SIZE + whash[w]) *
+				   LZ4KDS_SAMPLE_WAYS;
+			u32 k;
 
-			tries++;
-			sddc->stats.delta_attempts++;
-			dret = lz4kd_encode_delta(codec->encode_state,
-						  codec->window,
-						  codec->window + LZ4KDS_BLOCK_SIZE,
-						  codec->trial,
-						  LZ4KDS_BLOCK_SIZE,
-						  LZ4KDS_BLOCK_SIZE, 0);
-			if ((int)dret <= 0)
-				continue;
-			if (dret + LZ4KDS_HDR_REFERENCED >= plain_len)
-				continue;
-			if (!best || dret < best) {
-				memcpy(codec->best, codec->trial, dret);
-				best = dret;
-				best_id = cand->id;
+			for (k = 0; k < LZ4KDS_SAMPLE_WAYS &&
+			     tries < LZ4KDS_DELTA_TRIES; k++) {
+				u32 cid = sddc->samples[base + k];
+				struct lz4kds_ref *cand;
+				unsigned int dret;
+
+				if (!cid || cid >= LZ4KDS_REF_MAX)
+					continue;
+				cand = &sddc->refs[cid];
+				if (!cand->page || cand->whash[w] != whash[w])
+					continue;
+
+				memcpy(codec->window, cand->page, LZ4KDS_BLOCK_SIZE);
+				memcpy(codec->window + LZ4KDS_BLOCK_SIZE, src,
+				       LZ4KDS_BLOCK_SIZE);
+
+				tries++;
+				sddc->stats.delta_attempts++;
+				dret = lz4kd_encode_delta(codec->encode_state,
+							  codec->window,
+							  codec->window + LZ4KDS_BLOCK_SIZE,
+							  codec->trial,
+							  LZ4KDS_BLOCK_SIZE,
+							  LZ4KDS_BLOCK_SIZE, 0);
+				if ((int)dret <= 0)
+					continue;
+				if (dret + LZ4KDS_HDR_REFERENCED >= plain_len)
+					continue;
+				if (!best || dret < best) {
+					memcpy(codec->best, codec->trial, dret);
+					best = dret;
+					best_id = cand->id;
+				}
 			}
 		}
 
@@ -349,7 +451,12 @@ int lz4kds_sddc_compress(struct lz4kds_sddc *sddc, struct lz4kds_codec *codec,
 	memcpy(out + LZ4KDS_HDR_ORDINARY, codec->scratch, plain_len);
 	out[0] = LZ4KDS_KIND_ORDINARY;
 	*dst_len = LZ4KDS_HDR_ORDINARY + plain_len;
-	lz4kds_ref_publish(sddc, src, hash);
+	{
+		u32 whash[LZ4KDS_WINDOWS];
+
+		lz4kds_hash_windows(src, whash);
+		lz4kds_ref_publish(sddc, src, hash, whash);
+	}
 	sddc->stats.ordinary++;
 
 	return 0;
@@ -414,25 +521,6 @@ int lz4kds_sddc_decompress(struct lz4kds_sddc *sddc, struct lz4kds_codec *codec,
 	}
 
 	return 0;
-}
-
-void lz4kds_sddc_put_payload(struct lz4kds_sddc *sddc, const void *src,
-			     unsigned int src_len)
-{
-	const u8 *in = src;
-	struct lz4kds_ref *ref;
-	u32 id;
-
-	if (!sddc || IS_ERR(sddc) || !src || src_len < LZ4KDS_HDR_REFERENCED)
-		return;
-	if (in[0] != LZ4KDS_KIND_ALIAS && in[0] != LZ4KDS_KIND_DELTA)
-		return;
-
-	/* References are immortal; only the usage counter changes. */
-	memcpy(&id, in + 1, sizeof(id));
-	ref = lz4kds_ref_by_id(sddc, id);
-	if (ref)
-		atomic_dec_if_positive(&ref->users);
 }
 
 void lz4kds_sddc_get_stats(struct lz4kds_sddc *sddc, struct lz4kds_stats *out)
