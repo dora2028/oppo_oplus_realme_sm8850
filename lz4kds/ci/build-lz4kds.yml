@@ -109,6 +109,19 @@ jobs:
           make -j"$(nproc)" drivers/block/zram/
           ls -la drivers/block/zram/*.o
 
+      - name: 校验注入/回滚一致性
+        run: |
+          set -e
+          echo "=== check ==="
+          python3 lz4kds/scripts/lz4kds_inject.py "$KERNEL_ROOT" "$GITHUB_WORKSPACE/lz4kds" --mode check
+          echo "=== revert 到原始状态 ==="
+          python3 lz4kds/scripts/lz4kds_inject.py "$KERNEL_ROOT" "$GITHUB_WORKSPACE/lz4kds" --mode revert
+          git -C "$KERNEL_ROOT" status --porcelain drivers/block/zram include/linux \
+            | grep -v '^??' && { echo "错误：revert 后仍有改动"; exit 1; } || true
+          echo "revert 后工作区干净"
+          echo "=== 重新注入，继续后续编译 ==="
+          python3 lz4kds/scripts/lz4kds_inject.py "$KERNEL_ROOT" "$GITHUB_WORKSPACE/lz4kds"
+
       - name: 确认 lz4kds 已编入
         run: |
           set -e
