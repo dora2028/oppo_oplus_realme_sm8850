@@ -771,11 +771,15 @@ jobs:
             rm -f zram.ko
             # 去掉开机脚本里的 rmmod/insmod：zram 已内置，卸载会失败
             if [[ -f service.sh ]]; then
+              # 删除 rmmod/insmod 行，并把因删除而留下的连续 sleep 合并为一个
               sed -i '/rmmod zram/d; /insmod .*zram.ko/d' service.sh
+              sed -i '/^\s*sleep 5$/{{N;/^\s*sleep 5\n\s*sleep 5$/d}}' service.sh
             fi
             # 算法列表对齐实际可用后端（当前内核无 zstd 后端）
             if [[ -f action.sh ]]; then
-              sed -i 's/algorithms="lz4 zstd lzo lzo-rle lz4k lz4hc lz4kd 842 zstdn"/algorithms="lz4kds lz4kd lz4k lz4hc lz4 lzo-rle lzo 842 deflate"/' action.sh
+              # 只列内核里真实注册的后端：lz4kds/lz4kd/lz4k/lz4hc/lz4/lzo-rle/lzo/842
+              # （deflate 与 zstd 后端未编入本内核，去掉避免选了静默失败）
+              sed -i 's/algorithms="[^"]*"/algorithms="lz4kds lz4kd lz4k lz4hc lz4 lzo-rle lzo 842"/' action.sh
             fi
             zip -r ../zram-switch.zip ./* >/dev/null
             cd ..

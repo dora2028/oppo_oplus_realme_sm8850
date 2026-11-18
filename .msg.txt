@@ -1,14 +1,23 @@
-chore(ci): 按实际使用习惯调整默认参数
+fix(ci): 修正切换模块的算法列表与 service.sh 重复 sleep
 
-把 6.12.69 GKI 工作流的默认值调整为常用组合：
+两处修正（承接上一版"保留 ZRAM 算法切换模块"）：
 
-- ksu_type: bakasu -> none（无内置 KSU）
-- susfs_enable: true -> false
-- lz4kds_enable: false -> true（默认启用 LZ4KDS + zram 内置）
-- droidspaces_enable: false -> standard
-- better_net: false -> true
-- rekernel_enable: false -> true
-- baseband_guard: true -> false
-- ccache_update: false -> true（改动配置后自动刷新缓存）
+1. 算法列表按内核实际注册的后端对齐
+   本内核 zcomp 后端表实际只有：lz4kds / lz4kd / lz4k / lz4hc / lz4 /
+   lzo-rle / lzo / 842。deflate 与 zstd 后端未编入，列出会导致用户选中
+   后静默失败，故移除。
 
-kpm_enable、lz4_enable、bbr_enable、adios_enable、ccache_debug 保持原值。
+2. service.sh 去重 sleep
+   删除 rmmod/insmod 行后遗留了连续两个 sleep 5，合并为一个。
+
+关于 zstd / zstdn 的结论（本轮已实证，暂不处理）
+设备上 /vendor/lib/modules/zram.ko 含 lzo-rle / zstd / zstdn，即 zstdn
+是真实算法（此前判断有误，已更正）。但这套脚本启用 LZ4KDS 后会应用
+002-zstd.patch，该补丁对 include/linux/zstd.h 是 +77/-166，实测把
+backend_zstd.c 依赖的 12 个 kernel 封装接口全部删除
+（zstd_create_cdict_byreference、zstd_get_cparams、zstd_compress_using_cdict
+等均 GONE），因此 zstd 后端无法编译。
+
+按决定保持现状（C）：LZ4KDS 可用，zstd/zstdn 在本构建中不可用。
+若后续需要 zstd，可在 lz4kds 分支跳过 002-zstd.patch，改用 AOSP 原生
+zstd（其 zstd.h 完整提供上述 12 个接口）。
