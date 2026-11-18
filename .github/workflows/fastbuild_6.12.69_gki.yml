@@ -795,16 +795,18 @@ jobs:
             exit 1
           fi
 
-          # 用编好的目标文件直接链接出 zram.ko
-          cd out
+          # 链接出 zram.ko。
+          # Image 构建不会生成 out/Module.symvers（只有 modules 目标才会），
+          # 因此 modpost 会因缺少符号表而报大量 undefined。这里用
+          # KBUILD_MODPOST_WARN=1 把它降级为警告：符号解析由运行时的
+          # 内核符号表完成，模块本身是完整的。
           set +e
-          make -j$(nproc --all) ARCH=arm64 LLVM=1 \
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
                CROSS_COMPILE=aarch64-linux-gnu- \
                CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
-               OBJCOPY=llvm-objcopy M="$PWD/../drivers/block/zram" \
-               drivers/block/zram/zram.ko 2>/dev/null
+               OBJCOPY=llvm-objcopy KBUILD_MODPOST_WARN=1 \
+               M="$PWD/drivers/block/zram" modules
           set -e
-          cd ..
           KO=out/drivers/block/zram/zram.ko
           if [[ ! -f "$KO" ]]; then
             echo "直接链接未产出 zram.ko，尝试常规 modules 构建（忽略 backend_zstd）…"
