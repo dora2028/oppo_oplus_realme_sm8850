@@ -6,6 +6,9 @@
 - 只有少量差异的页 → 对该页的 LZ4KD 差分
 - 其余页 → 普通 LZ4KD 单页压缩
 
+> **接手/复现请先看 [HANDOFF.md](HANDOFF.md)**：项目坐标、当前进度、
+> 工作流程、踩过的坑、可调常量、自检清单。
+>
 > **改动清单与移植记录见 [ARCHIVE.md](ARCHIVE.md)**（改了哪些文件、
 > 改在什么位置、踩过哪些坑）。
 
@@ -31,7 +34,8 @@ lz4kds/
 ├── test/           用户态测试（链接真实 src/lz4kds_sddc.c）
 ├── ci/             独立 CI 配置
 ├── README.md
-└── ARCHIVE.md      移植存档
+├── ARCHIVE.md      移植存档
+└── HANDOFF.md      ★交接文档（新对话先读这个）
 ```
 
 ## 用法

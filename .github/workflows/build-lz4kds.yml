@@ -93,9 +93,12 @@ jobs:
           # even "make gki_defconfig" aborts with
           #   scripts/Kconfig.include:41: linker 'ld.lld' not found
           # so they must be installed here, not discovered at build time.
+          # libdw-dev provides dwarf.h, required by scripts/gendwarfksyms
+          # (GKI symbol list generation) — without it "make" fails at the
+          # scripts/ stage with: fatal error: 'dwarf.h' file not found.
           sudo apt-get install -y -qq build-essential bison flex bc \
-              libelf-dev libssl-dev python3 wget xz-utils \
-              clang lld llvm
+              libelf-dev libdw-dev libssl-dev python3 wget xz-utils \
+              clang lld llvm pahole
           echo "=== toolchain ==="
           clang --version | head -n 1
           ld.lld --version | head -n 1
