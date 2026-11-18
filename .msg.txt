@@ -1,31 +1,14 @@
-refactor(lz4kds): 合并为单开关，并保留 ZRAM 算法切换模块
+chore(ci): 按实际使用习惯调整默认参数
 
-按讨论结果，把 lz4kd_enable 并入 lz4kds_enable。
+把 6.12.69 GKI 工作流的默认值调整为常用组合：
 
-合并原因
-lz4kds 必然需要 lz4kd 的全部内容（include/linux/lz4kd.h、lib/lz4kd/ 编解码、
-ZRAM_BACKEND_LZ4KD 符号），单独开启 lz4kds 会在编译期因缺头文件失败。
-双开关属于"lz4kd 走外置模块"时期的遗留。
+- ksu_type: bakasu -> none（无内置 KSU）
+- susfs_enable: true -> false
+- lz4kds_enable: false -> true（默认启用 LZ4KDS + zram 内置）
+- droidspaces_enable: false -> standard
+- better_net: false -> true
+- rekernel_enable: false -> true
+- baseband_guard: true -> false
+- ccache_update: false -> true（改动配置后自动刷新缓存）
 
-改动
-- 移除 lz4kd_enable 输入项；lz4kd 补丁步骤改由 lz4kds_enable 驱动，
-  并在应用后校验头文件、lib/lz4kd/ 与 Kconfig 符号确实到位。
-- defconfig 合并为一个分支，一次写全 LZ4KD + SDDC + 内置化相关配置。
-- 清理 ak3.log 与 release 说明里的重复 LZ4KD 行。
-
-保留 ZRAM 算法切换模块
-之前误判该模块只是用来加载 zram.ko，实际它的核心价值是 action.sh：
-用音量键选择压缩算法与 ZRAM 大小的交互菜单，全部走标准 sysfs，
-与 zram.ko 无关。内置化后这个入口必须保留，否则用户无法切换算法。
-
-因此内置化场景下仍然打包该模块，但做三处适配：
-- 删除 zram.ko（内置后加载会与内置驱动冲突）
-- 删除 service.sh 里的 rmmod/insmod 行
-- action.sh 的算法列表对齐实际可用后端
-  （当前内核无 zstd 后端，去掉 zstd/zstdn）
-
-未做（按用户要求）
-zstd / zstdn 的可用性暂不处理。已查明原因：上游 002-zstd.patch 升级
-zstd 后，新版 include/linux/zstd.h 不再提供 backend_zstd.c 依赖的
-dictionary/advanced API（zstd_create_cdict_byreference、zstd_get_cparams、
-zstd_compress_using_cdict 等 12 个接口全部缺失），需要另行移植。
+kpm_enable、lz4_enable、bbr_enable、adios_enable、ccache_debug 保持原值。
