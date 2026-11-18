@@ -734,8 +734,14 @@ jobs:
 
           cd kernel_workspace/common
           # 复用 Image 构建留下的 .config / auto.conf，保证 vermagic 一致
-          if [[ ! -f out/include/config/auto.conf ]]; then
-            echo "错误：未找到内核构建产物 out/include/config/auto.conf"
+          echo "=== out/ 关键产物诊断 ==="
+          ls -la out/.config 2>/dev/null || echo "missing out/.config"
+          ls -la out/include/config/auto.conf 2>/dev/null || echo "missing out/include/config/auto.conf"
+          ls -la out/include/generated/autoconf.h 2>/dev/null || echo "missing out/include/generated/autoconf.h"
+          ls -la out/Module.symvers 2>/dev/null || echo "missing out/Module.symvers"
+          ls -la out/vmlinux 2>/dev/null || echo "missing out/vmlinux"
+          if [[ ! -f out/.config ]]; then
+            echo "错误：未找到 out/.config"
             exit 1
           fi
 
@@ -753,12 +759,26 @@ jobs:
                CROSS_COMPILE=aarch64-linux-gnu- \
                CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
                modules_prepare || true
+          # 优先复用 Image 的 O=out 产物，使模块 vermagic 与内核完全一致。
+          # 若该路径因产物不全失败，则回退到不带 O= 的构建。
+          set +e
           make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
                CROSS_COMPILE=aarch64-linux-gnu- \
                CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
-               OBJCOPY=llvm-objcopy M=drivers/block/zram modules
-
+               OBJCOPY=llvm-objcopy \
+               M="$PWD/drivers/block/zram" modules
+          RC=$?
+          set -e
           KO=out/drivers/block/zram/zram.ko
+          if [[ $RC -ne 0 || ! -f "$KO" ]]; then
+            echo "O=out 方式失败(rc=$RC)，回退到不带 O= 的构建…"
+            make -j$(nproc --all) ARCH=arm64 LLVM=1 \
+                 CROSS_COMPILE=aarch64-linux-gnu- \
+                 CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
+                 OBJCOPY=llvm-objcopy \
+                 M="$PWD/drivers/block/zram" modules
+            KO=drivers/block/zram/zram.ko
+          fi
           if [[ ! -f "$KO" ]]; then
             echo "错误：zram.ko 未生成"
             exit 1
