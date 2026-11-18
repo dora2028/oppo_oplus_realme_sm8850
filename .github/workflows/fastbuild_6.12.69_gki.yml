@@ -721,27 +721,55 @@ jobs:
         if: inputs.lz4kds_enable
         run: |
           echo "正在编译 zram.ko（含 LZ4KDS 后端）…"
-          cd kernel_workspace/common
+          WORKDIR="$(pwd)"
+          # 与"构建内核"步骤完全相同的工具链 PATH 顺序
+          export PATH="/usr/lib/ccache:$PATH"
           export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/rust/bin:$PATH"
+          export CLANG_DIR="$WORKDIR/kernel_workspace/clang19/bin"
           export LIBCLANG_PATH="$WORKDIR/kernel_workspace/clang19/lib"
-          export LLVM=1 LLVM_IAS=1
+          echo "clang: $($CLANG_DIR/clang --version | head -n1)"
+          echo "ld.lld: $($CLANG_DIR/ld.lld --version | head -n1)"
+
+          cd kernel_workspace/common
+          # 复用 Image 构建留下的 .config / auto.conf，保证 vermagic 一致
+          if [[ ! -f out/include/config/auto.conf ]]; then
+            echo "错误：未找到内核构建产物 out/include/config/auto.conf"
+            exit 1
+          fi
+
           export ARCH=arm64 SUBARCH=arm64
+          export LLVM=1 LLVM_IAS=1
           export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC="clang" LD="ld.lld" AR="llvm-ar" NM="llvm-nm" \
-                 OBJCOPY="llvm-objcopy" OBJDUMP="llvm-objdump" \
-                 READELF="llvm-readelf" STRIP="llvm-strip"
+          export HOSTCC=clang HOSTLD=ld.lld
+          export AR=llvm-ar NM=llvm-nm READELF=llvm-readelf
+          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
           export KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error -fno-stack-protector"
-          # Reuse the .config produced by the Image build so the module's
-          # vermagic and configuration match the kernel exactly.
+
+          # Image 已完整构建过，模块所需的准备步骤其实已完成；
+          # modules_prepare 在已有产物上可能因缺 vmlinux 报错，故容忍失败。
           make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" \
+               CROSS_COMPILE=aarch64-linux-gnu- \
+               CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
                modules_prepare || true
           make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" \
-               OBJCOPY="llvm-objcopy" M=drivers/block/zram modules
-          ls -la out/drivers/block/zram/*.ko
+               CROSS_COMPILE=aarch64-linux-gnu- \
+               CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
+               OBJCOPY=llvm-objcopy M=drivers/block/zram modules
+
+          KO=out/drivers/block/zram/zram.ko
+          if [[ ! -f "$KO" ]]; then
+            echo "错误：zram.ko 未生成"
+            exit 1
+          fi
+          ls -la "$KO"
+          echo "=== zram.ko vermagic ==="
+          strings "$KO" | grep -i vermagic | head -2 || true
+          echo "=== 内置压缩算法 ==="
+          strings "$KO" | grep -E '^(lz4kd|lz4kds|lz4|lz4hc|zstd|lzo-rle|lzo)$' | sort -u || true
           mkdir -p "$GITHUB_WORKSPACE/zram_out"
-          cp out/drivers/block/zram/zram.ko "$GITHUB_WORKSPACE/zram_out/zram.ko"
+          cp "$KO" "$GITHUB_WORKSPACE/zram_out/zram.ko"
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
