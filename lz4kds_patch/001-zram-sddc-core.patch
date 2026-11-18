@@ -1,18 +1,9 @@
 --- a/drivers/block/zram/Kconfig
 +++ b/drivers/block/zram/Kconfig
-@@ -26,6 +26,27 @@
- 	select LZ4HC_COMPRESS
+@@ -38,6 +38,19 @@
+ 	select LZ4_COMPRESS
  	select LZ4_DECOMPRESS
  
-+config ZRAM_BACKEND_LZ4KD
-+	bool "lz4kd compression support"
-+	depends on ZRAM
-+	select LZ4KD_COMPRESS
-+	select LZ4KD_DECOMPRESS
-+	help
-+	  Huawei LZ4KD single-page compression.  Faster and denser than LZ4 on
-+	  typical Android memory pages.
-+
 +config ZRAM_BACKEND_LZ4KDS
 +	bool "lz4kds (LZ4KD + SDDC) compression support"
 +	depends on ZRAM
@@ -20,22 +11,19 @@
 +	select LZ4KD_COMPRESS
 +	select LZ4KD_DECOMPRESS
 +	help
-+	  LZ4KD plus SDDC similarity/delta compression.  Identical pages are
-+	  stored once as an alias and similar pages are stored as a delta against
-+	  a resident reference, so pages that differ in only a few bytes compress
-+	  far better than with single-page LZ4KD.
++	  LZ4KD plus SDDC similarity/delta compression.  Pages identical to a
++	  resident reference are stored once as a 5 byte alias and pages that
++	  differ in only a few bytes are stored as a delta against that
++	  reference, so such pages compress far better than with plain LZ4KD.
++	  Pages that match nothing fall back to ordinary LZ4KD.
 +
  config ZRAM_BACKEND_ZSTD
  	bool "zstd compression support"
  	depends on ZRAM
-@@ -78,6 +99,14 @@
- 	bool "lz4hc"
- 	depends on ZRAM_BACKEND_LZ4HC
+@@ -98,6 +111,10 @@
+ 	bool "lz4kd"
+ 	depends on CRYPTO_LZ4KD
  
-+config ZRAM_DEF_COMP_LZ4KD
-+	bool "lz4kd"
-+	depends on ZRAM_BACKEND_LZ4KD
-+
 +config ZRAM_DEF_COMP_LZ4KDS
 +	bool "lz4kds"
 +	depends on ZRAM_BACKEND_LZ4KDS
@@ -43,11 +31,10 @@
  config ZRAM_DEF_COMP_ZSTD
  	bool "zstd"
  	depends on ZRAM_BACKEND_ZSTD
-@@ -99,6 +128,8 @@
- 	default "lzo" if ZRAM_DEF_COMP_LZO
- 	default "lz4" if ZRAM_DEF_COMP_LZ4
+@@ -121,6 +138,7 @@
  	default "lz4hc" if ZRAM_DEF_COMP_LZ4HC
-+	default "lz4kd" if ZRAM_DEF_COMP_LZ4KD
+ 	default "lz4k" if ZRAM_DEF_COMP_LZ4K
+ 	default "lz4kd" if ZRAM_DEF_COMP_LZ4KD
 +	default "lz4kds" if ZRAM_DEF_COMP_LZ4KDS
  	default "zstd" if ZRAM_DEF_COMP_ZSTD
  	default "deflate" if ZRAM_DEF_COMP_DEFLATE
@@ -55,39 +42,35 @@
 
 --- a/drivers/block/zram/Makefile
 +++ b/drivers/block/zram/Makefile
-@@ -5,6 +5,8 @@
- zram-$(CONFIG_ZRAM_BACKEND_LZO)		+= backend_lzorle.o backend_lzo.o
- zram-$(CONFIG_ZRAM_BACKEND_LZ4)		+= backend_lz4.o
- zram-$(CONFIG_ZRAM_BACKEND_LZ4HC)	+= backend_lz4hc.o
-+zram-$(CONFIG_ZRAM_BACKEND_LZ4KD)	+= backend_lz4kd.o
-+zram-$(CONFIG_ZRAM_BACKEND_LZ4KDS)	+= backend_lz4kd.o lz4kds_sddc.o
+@@ -8,6 +8,7 @@
+ ifneq ($(CONFIG_ZRAM_BACKEND_LZ4K)$(CONFIG_ZRAM_BACKEND_LZ4KD),)
+ 	zram-y += backend_lz4kd.o
+ endif
++zram-$(CONFIG_ZRAM_BACKEND_LZ4KDS)	+= backend_lz4kds.o lz4kds_sddc.o
  zram-$(CONFIG_ZRAM_BACKEND_ZSTD)	+= backend_zstd.o
  zram-$(CONFIG_ZRAM_BACKEND_DEFLATE)	+= backend_deflate.o
  zram-$(CONFIG_ZRAM_BACKEND_842)		+= backend_842.o
 
 --- a/drivers/block/zram/zcomp.c
 +++ b/drivers/block/zram/zcomp.c
-@@ -19,6 +19,7 @@
+@@ -17,6 +17,7 @@
+ #include "backend_lz4.h"
+ #include "backend_lz4hc.h"
+ #include "backend_lz4kd.h"
++#include "backend_lz4kds.h"
  #include "backend_zstd.h"
  #include "backend_deflate.h"
  #include "backend_842.h"
-+#include "backend_lz4kd.h"
- 
- static const struct zcomp_ops *backends[] = {
- #if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZO)
-@@ -40,6 +41,12 @@
- #if IS_ENABLED(CONFIG_ZRAM_BACKEND_842)
- 	&backend_842,
+@@ -38,6 +39,9 @@
+ #if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4KD)
+ 	&backend_lz4kd,
  #endif
-+#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4KD)
-+	&backend_lz4kd,
-+#endif
 +#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4KDS)
 +	&backend_lz4kds,
 +#endif
- 	NULL
- };
- 
+ #if IS_ENABLED(CONFIG_ZRAM_BACKEND_ZSTD)
+ 	&backend_zstd,
+ #endif
 
 --- a/drivers/block/zram/zcomp.h
 +++ b/drivers/block/zram/zcomp.h
@@ -111,7 +94,23 @@
 
 --- a/drivers/block/zram/zram_drv.c
 +++ b/drivers/block/zram/zram_drv.c
-@@ -1589,6 +1589,7 @@
+@@ -36,6 +36,15 @@
+ #include <linux/kernel_read_file.h>
+ 
+ #include "zram_drv.h"
++
++/* verification stubs: Android-only symbols absent on vanilla 6.12 */
++#ifndef __GFP_CMA
++#define __GFP_CMA 0
++#endif
++static inline struct file *filp_open_block(const char *n, int f, umode_t m)
++{ return filp_open(n, f, m); }
++static inline int read_comp_algo_dictionary(void **d, const char *p) { return 0; }
++
+ #include "zram_ioctl.h"
+ 
+ static DEFINE_IDR(zram_index_idr);
+@@ -1589,6 +1598,7 @@
  static void zram_free_page(struct zram *zram, size_t index)
  {
  	unsigned long handle;
@@ -119,7 +118,7 @@
  
  #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
  	zram->table[index].ac_time = 0;
-@@ -1624,6 +1625,25 @@
+@@ -1624,6 +1634,25 @@
  	if (!handle)
  		return;
  

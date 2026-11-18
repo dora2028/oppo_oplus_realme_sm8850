@@ -348,8 +348,12 @@ jobs:
           BASE=https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lz4kds_patch
           wget $BASE/001-zram-sddc-core.patch
           wget $BASE/002-zram-sddc-files.patch
-          patch -p1 -F 3 < 001-zram-sddc-core.patch
-          patch -p1 -F 3 < 002-zram-sddc-files.patch
+          # -N: 把"已存在/已应用"当作跳过而不是交互提问，避免 CI 卡死
+          patch -p1 -N -F 3 < 001-zram-sddc-core.patch
+          patch -p1 -N -F 3 < 002-zram-sddc-files.patch
+          echo "LZ4KDS 补丁应用完成"
+          grep -q backend_lz4kds drivers/block/zram/Makefile \
+            || { echo "错误：LZ4KDS 未正确接入 Makefile"; exit 1; }
           
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable
@@ -394,10 +398,10 @@ jobs:
             echo "CONFIG_ZRAM_BACKEND_842=y" >> ./common/arch/arm64/configs/gki_defconfig
           fi
           if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
-            # LZ4KDS 需要 LZ4KD 编解码与 zram 后端，且必须自行编译 zram.ko
+            # LZ4KDS 依赖 LZ4KD 编解码，并需要 zram 后端参与编译
             echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_ZRAM_BACKEND_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_LZ4KDS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            # zram 保持模块形态（GKI 默认 CONFIG_ZRAM=m），由本流程自行编译 zram.ko
             echo "CONFIG_ZRAM=m" >> ./common/arch/arm64/configs/gki_defconfig
           fi
           # 开启O2编译优化配置

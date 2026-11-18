@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/drivers/block/zram/lz4kds_sddc.c
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,512 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * LZ4KDS: LZ4KD + SDDC for the 6.12 zram driver.
@@ -303,9 +303,7 @@
 +	if (ret <= 0) {
 +		/* Incompressible: let zram store the page verbatim. */
 +		*dst_len = LZ4KDS_BLOCK_SIZE;
-+		spin_lock(&sddc->lock);
 +		sddc->stats.raw++;
-+		spin_unlock(&sddc->lock);
 +		return 0;
 +	}
 +	plain_len = ret;
@@ -320,13 +318,13 @@
 +		u32 id = ref->id;
 +
 +		lz4kds_ref_get_locked(ref);
-+		sddc->stats.aliases++;
-+		sddc->stats.saved_bytes += plain_len;
 +		spin_unlock(&sddc->lock);
 +
 +		out[0] = LZ4KDS_KIND_ALIAS;
 +		memcpy(out + 1, &id, sizeof(id));
 +		*dst_len = LZ4KDS_HDR_REFERENCED;
++		sddc->stats.aliases++;
++		sddc->stats.saved_bytes += plain_len;
 +		return 0;
 +	}
 +
@@ -386,15 +384,15 @@
 +
 +		if (best) {
 +			lz4kds_ref_get_locked(ref);
-+			sddc->stats.deltas++;
-+			sddc->stats.saved_bytes +=
-+				plain_len - LZ4KDS_HDR_REFERENCED - best;
 +			spin_unlock(&sddc->lock);
 +
 +			out[0] = LZ4KDS_KIND_DELTA;
 +			memcpy(out + 1, &id, sizeof(id));
 +			memcpy(out + LZ4KDS_HDR_REFERENCED, codec->best, best);
 +			*dst_len = LZ4KDS_HDR_REFERENCED + best;
++			sddc->stats.deltas++;
++			sddc->stats.saved_bytes +=
++				plain_len - LZ4KDS_HDR_REFERENCED - best;
 +			return 0;
 +		}
 +		sddc->stats.delta_no_gain++;
@@ -405,9 +403,9 @@
 +	out[0] = LZ4KDS_KIND_ORDINARY;
 +	*dst_len = LZ4KDS_HDR_ORDINARY + plain_len;
 +	lz4kds_ref_alloc_locked(sddc, src, hash);
-+	sddc->stats.ordinary++;
 +	spin_unlock(&sddc->lock);
 +
++	sddc->stats.ordinary++;
 +	return 0;
 +}
 +
@@ -427,18 +425,14 @@
 +				   src_len - LZ4KDS_HDR_ORDINARY,
 +				   LZ4KDS_BLOCK_SIZE);
 +		if (ret != LZ4KDS_BLOCK_SIZE) {
-+			spin_lock(&sddc->lock);
 +			sddc->stats.decode_failures++;
-+			spin_unlock(&sddc->lock);
 +			return -EINVAL;
 +		}
 +		return 0;
 +	}
 +
 +	if (in[0] != LZ4KDS_KIND_ALIAS && in[0] != LZ4KDS_KIND_DELTA) {
-+		spin_lock(&sddc->lock);
 +		sddc->stats.decode_failures++;
-+		spin_unlock(&sddc->lock);
 +		return -EINVAL;
 +	}
 +	if (src_len < LZ4KDS_HDR_REFERENCED)
@@ -449,8 +443,8 @@
 +	spin_lock(&sddc->lock);
 +	ref = lz4kds_ref_find_by_id(sddc, id);
 +	if (!ref) {
-+		sddc->stats.decode_failures++;
 +		spin_unlock(&sddc->lock);
++		sddc->stats.decode_failures++;
 +		return -EINVAL;
 +	}
 +	lz4kds_ref_get_locked(ref);
@@ -481,8 +475,8 @@
 +fail:
 +	spin_lock(&sddc->lock);
 +	lz4kds_ref_put_locked(sddc, ref);
-+	sddc->stats.decode_failures++;
 +	spin_unlock(&sddc->lock);
++	sddc->stats.decode_failures++;
 +	return -EINVAL;
 +}
 +
@@ -605,18 +599,24 @@
 +
 +#endif /* _LZ4KDS_SDDC_H */
 --- /dev/null
-+++ b/drivers/block/zram/backend_lz4kd.c
-@@ -0,0 +1,205 @@
++++ b/drivers/block/zram/backend_lz4kds.c
+@@ -0,0 +1,149 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
-+ * zram backend for LZ4KD and LZ4KDS (LZ4KD + SDDC).
++ * zram backend for LZ4KDS (LZ4KD + SDDC).
 + *
-+ *   "lz4kd"   pure Huawei LZ4KD single-page compression
-+ *   "lz4kds"  LZ4KD plus SDDC alias/delta representation
++ * This backend adds the "lz4kds" algorithm on top of the plain "lz4kd"
++ * backend provided by other_patch/lz4kd.patch.  Unlike that backend -- which
++ * only tunes LZ4's acceleration factor -- LZ4KDS uses the real Huawei LZ4KD
++ * codec from lib/lz4kd/ together with SDDC similarity/delta compression:
 + *
-+ * The SDDC reference table is per zcomp instance (per zram device) and is
-+ * stored in params->drv_data, which the zcomp API reserves for backend
-+ * private data.  Per-CPU scratch state lives in the zcomp context.
++ *   - a page identical to a resident reference becomes a 5 byte alias
++ *   - a page similar to a resident reference becomes an LZ4KD delta stream
++ *   - everything else falls back to ordinary single-page LZ4KD
++ *
++ * The SDDC reference table is per zcomp instance (per zram device) and lives
++ * in params->drv_data, which the zcomp API reserves for backend private data.
++ * Per-CPU scratch state lives in the zcomp context.
 + *
 + * Reference accounting needs one extra hook that the 6.12 zcomp_ops does not
 + * provide: when zram drops a slot it frees the zsmalloc object without ever
@@ -628,13 +628,12 @@
 +#include <linux/kernel.h>
 +#include <linux/slab.h>
 +#include <linux/err.h>
-+#include <linux/highmem.h>
 +
-+#include "backend_lz4kd.h"
++#include "backend_lz4kds.h"
 +#include "lz4kds_sddc.h"
 +#include <linux/lz4kd.h>
 +
-+static void lz4kd_release_params(struct zcomp_params *params)
++static void lz4kds_release_params(struct zcomp_params *params)
 +{
 +	struct lz4kds_sddc *sddc = params->drv_data;
 +
@@ -645,14 +644,26 @@
 +	params->drv_data = NULL;
 +}
 +
-+static int lz4kd_setup_params(struct zcomp_params *params)
++static int lz4kds_setup_params(struct zcomp_params *params)
 +{
++	struct lz4kds_sddc *sddc;
++
 +	if (params->level == ZCOMP_PARAM_NO_LEVEL)
 +		params->level = 0;
++
++	if (params->drv_data)
++		return 0;
++
++	/* setup_params() runs once per zcomp in process context. */
++	sddc = lz4kds_sddc_create();
++	if (IS_ERR(sddc))
++		return PTR_ERR(sddc);
++
++	params->drv_data = sddc;
 +	return 0;
 +}
 +
-+static void lz4kd_destroy(struct zcomp_ctx *ctx)
++static void lz4kds_destroy_ctx(struct zcomp_ctx *ctx)
 +{
 +	struct lz4kds_codec *codec = ctx->context;
 +
@@ -663,7 +674,7 @@
 +	ctx->context = NULL;
 +}
 +
-+static int lz4kd_create(struct zcomp_params *params, struct zcomp_ctx *ctx)
++static int lz4kds_create_ctx(struct zcomp_params *params, struct zcomp_ctx *ctx)
 +{
 +	struct lz4kds_codec *codec;
 +
@@ -674,79 +685,6 @@
 +	ctx->context = codec;
 +	return 0;
 +}
-+
-+/*
-+ * Create the SDDC table for this zcomp.  setup_params() runs once per zcomp
-+ * during device init in process context, so it may sleep.
-+ */
-+static int lz4kds_setup_params(struct zcomp_params *params)
-+{
-+	struct lz4kds_sddc *sddc;
-+
-+	lz4kd_setup_params(params);
-+
-+	if (params->drv_data)
-+		return 0;
-+
-+	sddc = lz4kds_sddc_create();
-+	if (IS_ERR(sddc))
-+		return PTR_ERR(sddc);
-+
-+	params->drv_data = sddc;
-+	return 0;
-+}
-+
-+/* ================= LZ4KD (plain) ================= */
-+
-+static int lz4kd_compress(struct zcomp_params *params, struct zcomp_ctx *ctx,
-+			  struct zcomp_req *req)
-+{
-+	struct lz4kds_codec *codec = ctx->context;
-+	int ret;
-+
-+	if (!codec)
-+		return -EINVAL;
-+
-+	ret = lz4kd_encode(codec->encode_state, req->src, req->dst,
-+			   req->src_len, req->dst_len, 0);
-+	if (ret < 0)
-+		return -EINVAL;
-+	if (ret == 0) {
-+		/* Incompressible: hand the page back so zram stores it raw. */
-+		if (req->dst_len < req->src_len)
-+			return -EINVAL;
-+		memcpy(req->dst, req->src, req->src_len);
-+		req->dst_len = req->src_len;
-+		return 0;
-+	}
-+
-+	req->dst_len = ret;
-+	return 0;
-+}
-+
-+static int lz4kd_decompress(struct zcomp_params *params, struct zcomp_ctx *ctx,
-+			    struct zcomp_req *req)
-+{
-+	int ret;
-+
-+	ret = lz4kd_decode(req->src, req->dst, req->src_len, req->dst_len);
-+	if (ret != req->dst_len)
-+		return -EINVAL;
-+
-+	return 0;
-+}
-+
-+const struct zcomp_ops backend_lz4kd = {
-+	.compress	= lz4kd_compress,
-+	.decompress	= lz4kd_decompress,
-+	.create_ctx	= lz4kd_create,
-+	.destroy_ctx	= lz4kd_destroy,
-+	.setup_params	= lz4kd_setup_params,
-+	.release_params	= lz4kd_release_params,
-+	.name		= "lz4kd",
-+};
-+
-+/* ================= LZ4KDS (LZ4KD + SDDC) ================= */
 +
 +static int lz4kds_compress(struct zcomp_params *params, struct zcomp_ctx *ctx,
 +			   struct zcomp_req *req)
@@ -805,28 +743,24 @@
 +const struct zcomp_ops backend_lz4kds = {
 +	.compress	= lz4kds_compress,
 +	.decompress	= lz4kds_decompress,
-+	.create_ctx	= lz4kd_create,
-+	.destroy_ctx	= lz4kd_destroy,
++	.create_ctx	= lz4kds_create_ctx,
++	.destroy_ctx	= lz4kds_destroy_ctx,
 +	.setup_params	= lz4kds_setup_params,
-+	.release_params	= lz4kd_release_params,
++	.release_params	= lz4kds_release_params,
 +	.release	= lz4kds_release,
 +	.name		= "lz4kds",
 +};
 --- /dev/null
-+++ b/drivers/block/zram/backend_lz4kd.h
-@@ -0,0 +1,15 @@
++++ b/drivers/block/zram/backend_lz4kds.h
+@@ -0,0 +1,11 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
-+#ifndef _BACKEND_LZ4KD_H
-+#define _BACKEND_LZ4KD_H
++#ifndef _BACKEND_LZ4KDS_H
++#define _BACKEND_LZ4KDS_H
 +
 +#include "zcomp.h"
-+
-+#ifdef CONFIG_ZRAM_BACKEND_LZ4KD
-+extern const struct zcomp_ops backend_lz4kd;
-+#endif
 +
 +#ifdef CONFIG_ZRAM_BACKEND_LZ4KDS
 +extern const struct zcomp_ops backend_lz4kds;
 +#endif
 +
-+#endif /* _BACKEND_LZ4KD_H */
++#endif /* _BACKEND_LZ4KDS_H */
