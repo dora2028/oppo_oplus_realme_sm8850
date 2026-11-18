@@ -1,0 +1,133 @@
+name: LZ4KDS (independent build)
+
+# 独立构建配置：只负责把 lz4kds/ 注入上游内核树并编译出 zram 相关产物。
+# 不修改上游任何 workflow，可与上游流程并存。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: '内核版本分支（AOSP common 的 ref）'
+        required: true
+        type: string
+        default: 'android16-6.12'
+      kernel_dir_name:
+        description: '内核源码目录名（上游脚本里通常叫 common）'
+        required: true
+        type: string
+        default: 'common'
+      run_host_tests:
+        description: '是否先跑用户态算法测试'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  host-test:
+    if: inputs.run_host_tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 用户态算法测试（alias / delta / 普通 / 原始 往返 + 压测）
+        run: |
+          set -e
+          gcc -O2 -include lz4kds/test/kshim.h \
+              -I lz4kds/include -I lz4kds/src \
+              -o /tmp/sddc_test \
+              lz4kds/test/sddc_test.c \
+              lz4kds/src/lz4kd_encode.c \
+              lz4kds/src/lz4kd_encode_delta.c \
+              lz4kds/src/lz4kd_decode.c \
+              lz4kds/src/lz4kd_decode_delta.c
+          /tmp/sddc_test | tee /tmp/sddc_test.log
+          grep -q 'RESULT: PASS' /tmp/sddc_test.log
+
+  build:
+    needs: [host-test]
+    if: always() && (needs.host-test.result == 'success' || needs.host-test.result == 'skipped')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bison flex bc \
+              libelf-dev libssl-dev python3 wget xz-utils
+
+      - name: 获取 AOSP common 内核源码
+        run: |
+          set -e
+          git clone --depth=1 \
+            -b "${{ inputs.kernel_version }}" \
+            https://android.googlesource.com/kernel/common \
+            "${{ inputs.kernel_dir_name }}"
+          echo "KERNEL_ROOT=$GITHUB_WORKSPACE/${{ inputs.kernel_dir_name }}" >> $GITHUB_ENV
+
+      - name: 注入 LZ4KDS（幂等）
+        run: |
+          set -e
+          python3 lz4kds/scripts/lz4kds_inject.py \
+            "$KERNEL_ROOT" "$GITHUB_WORKSPACE/lz4kds"
+          echo "=== 注入后确认 ==="
+          grep -n 'lz4kds' "$KERNEL_ROOT/drivers/block/zram/Makefile"
+          grep -n 'backend_lz4kds' "$KERNEL_ROOT/drivers/block/zram/zcomp.c"
+          grep -n 'ZRAM_BACKEND_LZ4KDS' "$KERNEL_ROOT/drivers/block/zram/Kconfig"
+          test -f "$KERNEL_ROOT/include/linux/lz4kd.h"
+          test -f "$KERNEL_ROOT/drivers/block/zram/lz4kds_sddc.c"
+
+      - name: 配置（zram 内置 + LZ4KDS）
+        run: |
+          set -e
+          cd "$KERNEL_ROOT"
+          CFG=arch/arm64/configs/gki_defconfig
+          {
+            echo "CONFIG_ZRAM=y"
+            echo "CONFIG_ZSMALLOC=y"
+            echo "CONFIG_ZRAM_BACKEND_LZ4=y"
+            echo "CONFIG_ZRAM_BACKEND_LZO=y"
+            echo "CONFIG_ZRAM_BACKEND_LZ4KDS=y"
+            echo "CONFIG_LZ4KD_COMPRESS=y"
+            echo "CONFIG_LZ4KD_DECOMPRESS=y"
+            echo "# CONFIG_ZRAM_BACKEND_ZSTD is not set"
+          } >> "$CFG"
+
+      - name: 编译 zram 相关对象
+        run: |
+          set -e
+          cd "$KERNEL_ROOT"
+          export ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error"
+          make -j"$(nproc)" gki_defconfig
+          make -j"$(nproc)" drivers/block/zram/
+          ls -la drivers/block/zram/*.o
+
+      - name: 确认 lz4kds 已编入
+        run: |
+          set -e
+          cd "$KERNEL_ROOT"
+          for f in lz4kds_backend.o lz4kds_sddc.o lz4kd_encode.o \
+                   lz4kd_encode_delta.o lz4kd_decode.o lz4kd_decode_delta.o; do
+            test -f "drivers/block/zram/$f" || { echo "缺少 $f"; exit 1; }
+            echo "OK $f"
+          done
+          # 后端符号必须出现在 zcomp.o 里（说明已注册进后端表）
+          aarch64-linux-gnu-nm drivers/block/zram/zcomp.o 2>/dev/null \
+            | grep -q backend_lz4kds \
+            && echo "OK backend registered in zcomp.o" \
+            || { echo "错误：zcomp.o 未引用 backend_lz4kds"; exit 1; }
+
+      - name: 上传对象文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: lz4kds-zram-objects
+          path: |
+            ${{ inputs.kernel_dir_name }}/drivers/block/zram/*.o
+          if-no-files-found: error

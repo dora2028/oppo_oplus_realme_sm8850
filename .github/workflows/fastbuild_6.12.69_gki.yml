@@ -15,7 +15,7 @@ on:
         description: 'KernelSU分支(BakaSU/SukiSU Ultra/KernelSU Next/KSU(原版)/无内置KSU,默认BakaSU)'
         required: true
         type: choice
-        default: 'none'
+        default: 'bakasu'
         options:
           - 'bakasu'
           - 'sukisu'
@@ -26,7 +26,7 @@ on:
         description: '是否开启susfs(用于增强隐藏环境挂载功能; 可能轻微增加耗电，上游更新导致不稳定时或不需要可关闭)'
         required: true
         type: boolean
-        default: 'false'
+        default: 'true'
       kpm_enable:
         description: '是否开启kpm(使用KpatchNext独立实现kpm(支持任意KSU/面具环境); 不需要可保持默认关闭)'
         required: true
@@ -37,11 +37,11 @@ on:
         required: true
         type: boolean
         default: 'true'
-      lz4kds_enable:
-        description: '是否启用 LZ4KDS(LZ4KD+SDDC 相似页/差分压缩)。会自动引入 LZ4KD 编解码与 zram 后端，并把 zram 内置进内核'
+      lz4kd_enable:
+        description: '是否安装 LZ4KD 补丁(若已开启lz4+zstd补丁则可不开启)'
         required: true
         type: boolean
-        default: 'true'
+        default: 'false'
       bbr_enable:
         description: "是否启用bbr算法(优化上行数据,对手机日用无太大意义甚至可能负优化;false关闭,true仅加入算法,default启用算法并设为默认)"
         required: true
@@ -55,7 +55,7 @@ on:
         description: '是否启用Droidspaces容器支持(轻量化的完整Linux容器支持;false关闭,standard开启容器+ntsync支持,extend开启更多测试支持项)'
         required: true
         type: choice
-        default: 'standard'
+        default: 'false'
         options:
           - 'false'
           - 'standard'
@@ -64,7 +64,7 @@ on:
         description: '是否开启网络功能拓展配置(用于为ipset及需要iptables等高级网络功能内核支持的程序提供支持)'
         required: true
         type: boolean
-        default: 'true'
+        default: 'false'
       adios_enable:
         description: '是否启用ADIOS IO调度器支持(提升IO读写性能)'
         required: true
@@ -74,17 +74,17 @@ on:
         description: '是否启用Re-Kernel支持(与Freezer/NoActive等软件配合, 提升应用冻结能力)'
         required: true
         type: boolean
-        default: 'true'
+        default: 'false'
       baseband_guard:
         description: '是否开启内核级基带保护(阻止一切对非用户分区的写入，有效防止格机)'
         required: true
         type: boolean
-        default: 'false'
+        default: 'true'
       ccache_update:
         description: '更新ccache缓存(将本次编译生成的ccache缓存覆盖至仓库缓存，在更改编译配置、源码或需要刷新缓存时开启)'
         required: true
         type: boolean
-        default: 'true'
+        default: 'false'
       ccache_debug:
         description: '是否上传 Ccache调试日志(用于调试, 无需要不必开启)'
         required: true
@@ -328,33 +328,12 @@ jobs:
           patch -p1 -F 3 < 002-zstd.patch || true
 
       - name: 应用 lz4kd 补丁
-        if: inputs.lz4kds_enable
+        if: inputs.lz4kd_enable
         run: |
-          echo "正在添加 lz4kd 补丁（LZ4KDS 的编解码依赖）…"
+          echo "正在添加lz4kd补丁…"
           cd kernel_workspace/common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/lz4kd.patch
-          # LZ4KDS 的 Kconfig 依赖 ZRAM_BACKEND_LZ4KD，并需要 include/linux/lz4kd.h
-          # 与 lib/lz4kd/ 编解码实现，这些全部由本补丁提供。
-          patch -p1 -F 3 < lz4kd.patch
-          test -f include/linux/lz4kd.h || { echo "错误：lz4kd 补丁未提供 include/linux/lz4kd.h"; exit 1; }
-          test -d lib/lz4kd || { echo "错误：lz4kd 补丁未提供 lib/lz4kd/"; exit 1; }
-          grep -q 'config ZRAM_BACKEND_LZ4KD$' drivers/block/zram/Kconfig \
-            || { echo "错误：lz4kd 补丁未注册 ZRAM_BACKEND_LZ4KD"; exit 1; }
-
-      - name: 应用 LZ4KDS (LZ4KD + SDDC) 补丁
-        if: inputs.lz4kds_enable
-        run: |
-          echo "正在添加 LZ4KDS 补丁…"
-          cd kernel_workspace/common
-          BASE=https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lz4kds_patch
-          wget $BASE/001-zram-sddc-core.patch
-          wget $BASE/002-zram-sddc-files.patch
-          # -N: 把"已存在/已应用"当作跳过而不是交互提问，避免 CI 卡死
-          patch -p1 -N -F 3 < 001-zram-sddc-core.patch
-          patch -p1 -N -F 3 < 002-zram-sddc-files.patch
-          echo "LZ4KDS 补丁应用完成"
-          grep -q backend_lz4kds drivers/block/zram/Makefile \
-            || { echo "错误：LZ4KDS 未正确接入 Makefile"; exit 1; }
+          patch -p1 -F 3 < lz4kd.patch || true
           
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable
@@ -386,23 +365,17 @@ jobs:
           # 添加对 Mountify (backslashxx/mountify) 模块的支持
           echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
-            # LZ4KDS = LZ4KD 编解码 + SDDC 差分，二者一起编进内核。
+          if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
+            echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_CRYPTO_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_CRYPTO_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
+            #以下配置选项用于编译zram模块，开启与否不影响内核编译
             echo "CONFIG_ZRAM_BACKEND_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_842=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_ZRAM_BACKEND_LZ4KDS=y" >> ./common/arch/arm64/configs/gki_defconfig
-            # 关闭 zstd 后端：上游 002-zstd.patch 升级 zstd 后，backend_zstd.c
-            # 依赖的 dictionary/advanced API 未被新版 zstd.h 提供，无法编译。
-            echo "# CONFIG_ZRAM_BACKEND_ZSTD is not set" >> ./common/arch/arm64/configs/gki_defconfig
-            # zram 内置进内核（=y）：LZ4KDS 随 Image 直接生效，无需外置 zram.ko
-            echo "CONFIG_ZRAM=y" >> ./common/arch/arm64/configs/gki_defconfig
-            echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
           fi
           # 开启O2编译优化配置
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -759,33 +732,8 @@ jobs:
           else
             KSU_TYPENAME="none"
           fi
-          # 附带 ZRAM 算法切换模块。
-          # zram 已内置进内核（CONFIG_ZRAM=y），因此模块只保留交互菜单
-          # （action.sh / service.sh），剔除 zram.ko 与 rmmod/insmod 逻辑，
-          # 避免与内置驱动冲突。
-          if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
+          if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
             wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
-            rm -rf zram_switch && mkdir zram_switch
-            cd zram_switch
-            unzip -o ../zram.zip >/dev/null 2>&1 || true
-            rm -f zram.ko
-            # 去掉开机脚本里的 rmmod/insmod：zram 已内置，卸载会失败
-            if [[ -f service.sh ]]; then
-              # 删除 rmmod/insmod 行，并把因删除而留下的连续 sleep 合并为一个
-              sed -i '/rmmod zram/d; /insmod .*zram.ko/d' service.sh
-              sed -i '/^\s*sleep 5$/{{N;/^\s*sleep 5\n\s*sleep 5$/d}}' service.sh
-            fi
-            # 算法列表对齐实际可用后端（当前内核无 zstd 后端）
-            if [[ -f action.sh ]]; then
-              # 只列内核里真实注册的后端：lz4kds/lz4kd/lz4k/lz4hc/lz4/lzo-rle/lzo/842
-              # （deflate 与 zstd 后端未编入本内核，去掉避免选了静默失败）
-              sed -i 's/algorithms="[^"]*"/algorithms="lz4kds lz4kd lz4k lz4hc lz4 lzo-rle lzo 842"/' action.sh
-            fi
-            zip -r ../zram-switch.zip ./* >/dev/null
-            cd ..
-            rm -rf zram_switch zram.zip
-            mv zram-switch.zip zram.zip
-            echo "已打包 ZRAM 算法切换模块（内置 zram 版，不含 zram.ko）"
           fi
           if [[ ${{ github.event.inputs.kpm_enable }} == 'true' ]]; then
             wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip
@@ -819,7 +767,7 @@ jobs:
           echo "susfs: ${{ github.event.inputs.susfs_enable }}" >> ./ak3.log
           echo "KPM: ${{ github.event.inputs.kpm_enable }}" >> ./ak3.log
           echo "LZ4: ${{ github.event.inputs.lz4_enable }}" >> ./ak3.log
-          echo "LZ4KDS: ${{ github.event.inputs.lz4kds_enable }}" >> ./ak3.log
+          echo "LZ4KD: ${{ github.event.inputs.lz4kd_enable }}" >> ./ak3.log
           echo "IPset: ${{ github.event.inputs.better_net }}" >> ./ak3.log
           echo "BBR&Brutal: ${{ github.event.inputs.bbr_enable }}" >> ./ak3.log
           echo "Droidspaces: ${{ github.event.inputs.droidspaces_enable }}" >> ./ak3.log
@@ -903,7 +851,7 @@ jobs:
           - susfs支持：${{ github.event.inputs.susfs_enable }}
           - KPM支持 ：${{ github.event.inputs.kpm_enable }}
           - LZ4支持：${{ github.event.inputs.lz4_enable }}
-          - LZ4KDS(LZ4KD+SDDC)支持：${{ github.event.inputs.lz4kds_enable }}（zram 内置进内核）
+          - LZ4KD支持：${{ github.event.inputs.lz4kd_enable }}
           - 网络功能增强：${{ github.event.inputs.better_net }}
           - BBR/Brutal 等拥塞控制算法支持：${{ github.event.inputs.bbr_enable }}
           - Droidspaces 容器支持：${{ github.event.inputs.droidspaces_enable }}

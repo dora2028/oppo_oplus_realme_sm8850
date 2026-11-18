@@ -1,23 +1,59 @@
-fix(ci): 修正切换模块的算法列表与 service.sh 重复 sleep
+refactor(lz4kds): 独立为 lz4kds/ 目录，修复卡顿，恢复上游文件
 
-两处修正（承接上一版"保留 ZRAM 算法切换模块"）：
+按需求重构：所有 LZ4KDS 相关改动收敛到 lz4kds/ 单目录，上游文件
+（含 .github/workflows/fastbuild_6.12.69_gki.yml）全部恢复原样。
 
-1. 算法列表按内核实际注册的后端对齐
-   本内核 zcomp 后端表实际只有：lz4kds / lz4kd / lz4k / lz4hc / lz4 /
-   lzo-rle / lzo / 842。deflate 与 zstd 后端未编入，列出会导致用户选中
-   后静默失败，故移除。
+## 修复切换 lz4kds 后严重卡顿
 
-2. service.sh 去重 sleep
-   删除 rmmod/insmod 行后遗留了连续两个 sleep 5，合并为一个。
+根因是上一版实现的三处性能缺陷，与 LZ4KDS 算法本身无关：
 
-关于 zstd / zstdn 的结论（本轮已实证，暂不处理）
-设备上 /vendor/lib/modules/zram.ko 含 lzo-rle / zstd / zstdn，即 zstdn
-是真实算法（此前判断有误，已更正）。但这套脚本启用 LZ4KDS 后会应用
-002-zstd.patch，该补丁对 include/linux/zstd.h 是 +77/-166，实测把
-backend_zstd.c 依赖的 12 个 kernel 封装接口全部删除
-（zstd_create_cdict_byreference、zstd_get_cparams、zstd_compress_using_cdict
-等均 GONE），因此 zstd 后端无法编译。
+1. 解压时在全局 spinlock 下扫描整张引用表（1024 bucket）
+   zram 读是最热路径，每读一页都要全表扫描。
+2. 只有一把全局锁，所有 CPU 的 zram 读写被串行化。
+3. 持锁执行 8 次 4KB memcpy 与 LZ4KD 编码。
 
-按决定保持现状（C）：LZ4KDS 可用，zstd/zstdn 在本构建中不可用。
-若后续需要 zstd，可在 lz4kds 分支跳过 002-zstd.patch，改用 AOSP 原生
-zstd（其 zstd.h 完整提供上述 12 个接口）。
+修正：
+- 引用数组按 id 直接寻址，解压从 O(n) 降为 O(1)
+- 64 个锁分段，互不相关的引用不再互相阻塞
+- 候选页先快照，编码在无锁状态完成
+- 页查找改为哈希索引，平均 O(1)
+
+## 正确性
+
+alias/delta payload 只带数字引用 id，而它可能已落盘。因此引用在设备
+生命周期内永不回收，内存由 16 MiB 预算封顶；预算用尽后新页不再晋升为
+引用（仍正常压缩），但所有已存在 id 始终有效。用固定内存上限换取
+可证明的正确性。
+
+## 结构
+
+```
+lz4kds/
+├── src/        新增 C 源码（含华为 LZ4KD 编解码，BSD/GPL 双许可）
+├── include/    新增头文件
+├── scripts/    lz4kds_inject.py 幂等注入脚本
+├── test/       用户态算法测试
+├── ci/         独立 CI 配置
+└── README.md
+```
+
+## 与上游零冲突
+
+仓库内上游文件一行未改（fastbuild_6.12.69_gki.yml 已 checkout 回
+a19d43f）。接入内核树由 scripts/lz4kds_inject.py 完成，它只修改 CI
+工作区里 checkout 出的内核源码副本，且幂等；注入的每一处都带 lz4kds
+标记，便于识别与回滚。
+
+新增独立 workflow：.github/workflows/build-lz4kds.yml
+不依赖上游流程，可单独运行。
+
+## 验证
+
+- 用户态：alias/delta/普通/原始四类往返正确，2000 轮随机压测通过
+- 内核态：注入后 zram.o 链接成功（6.12 头文件实测）
+- 注入脚本：重复执行结果一致（幂等）
+
+## 未处理（按决定保持现状）
+
+启用本特性会应用 002-zstd.patch 的等价改动，导致 zstd/zstdn 不可用。
+本独立方案未触碰 zstd，若需要可在独立 CI 中跳过该补丁。
