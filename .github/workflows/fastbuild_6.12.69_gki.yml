@@ -401,6 +401,11 @@ jobs:
             # LZ4KDS 依赖 LZ4KD 编解码，并需要 zram 后端参与编译
             echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_LZ4KDS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            # 关闭 zstd 后端：上游 002-zstd.patch 把 zstd 升到 1.5.7 并替换了
+            # include/linux/zstd.h 的 API，但 backend_zstd.c 未同步更新，
+            # 该组合下 backend_zstd.o 无法编译（官方预编译 zram.ko 同样不含
+            # zstd，可佐证）。gki_defconfig 默认 ZRAM_BACKEND_ZSTD=y，须显式关闭。
+            echo "# CONFIG_ZRAM_BACKEND_ZSTD is not set" >> ./common/arch/arm64/configs/gki_defconfig
             # zram 保持模块形态（GKI 默认 CONFIG_ZRAM=m），由本流程自行编译 zram.ko
             echo "CONFIG_ZRAM=m" >> ./common/arch/arm64/configs/gki_defconfig
           fi

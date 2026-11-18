@@ -1,0 +1,23 @@
+fix(ci): 关闭 zstd 后端以解除 backend_zstd.c 编译失败
+
+从 artifact 里的完整日志定位到真正原因：
+
+  backend_zstd.c:18: error: unknown type name 'zstd_custom_mem'
+  backend_zstd.c:81: error: call to undeclared function 'zstd_create_cdict_byreference'
+  backend_zstd.c:189: error: call to undeclared function 'zstd_compress_using_cdict'
+  ... 16 errors
+
+GKI 的 gki_defconfig 默认 CONFIG_ZRAM_BACKEND_ZSTD=y，因此
+backend_zstd.o 必然参与编译；而上游 002-zstd.patch 把 zstd 升到 1.5.7
+并替换了 include/linux/zstd.h 的 API，backend_zstd.c 却没有同步更新，
+二者不兼容。官方预编译的 zram.ko 同样不含 zstd，可以佐证这一点。
+
+调整
+- 在 lz4kds_enable 分支显式写入 CONFIG_ZRAM_BACKEND_ZSTD is not set。
+- 安全性：zram 是模块（CONFIG_ZRAM=m），backend_zstd.o 只属于该模块，
+  不影响 Image；默认压缩器是 ZRAM_DEF_COMP_LZ4KD，不依赖 zstd 后端，
+  因此不会产生 Kconfig 依赖错误。
+
+上一轮已确认可编译通过的部分：
+  CC [M] zcomp.o、zram_drv.o、backend_lzo.o、backend_lzorle.o、
+  backend_lz4kd.o 等，以及我新增的 backend_lz4kds.o、lz4kds_sddc.o
