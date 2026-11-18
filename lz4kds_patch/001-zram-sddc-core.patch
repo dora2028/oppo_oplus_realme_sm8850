@@ -1,0 +1,147 @@
+--- a/drivers/block/zram/Kconfig
++++ b/drivers/block/zram/Kconfig
+@@ -26,6 +26,27 @@
+ 	select LZ4HC_COMPRESS
+ 	select LZ4_DECOMPRESS
+ 
++config ZRAM_BACKEND_LZ4KD
++	bool "lz4kd compression support"
++	depends on ZRAM
++	select LZ4KD_COMPRESS
++	select LZ4KD_DECOMPRESS
++	help
++	  Huawei LZ4KD single-page compression.  Faster and denser than LZ4 on
++	  typical Android memory pages.
++
++config ZRAM_BACKEND_LZ4KDS
++	bool "lz4kds (LZ4KD + SDDC) compression support"
++	depends on ZRAM
++	depends on ZRAM_BACKEND_LZ4KD
++	select LZ4KD_COMPRESS
++	select LZ4KD_DECOMPRESS
++	help
++	  LZ4KD plus SDDC similarity/delta compression.  Identical pages are
++	  stored once as an alias and similar pages are stored as a delta against
++	  a resident reference, so pages that differ in only a few bytes compress
++	  far better than with single-page LZ4KD.
++
+ config ZRAM_BACKEND_ZSTD
+ 	bool "zstd compression support"
+ 	depends on ZRAM
+@@ -78,6 +99,14 @@
+ 	bool "lz4hc"
+ 	depends on ZRAM_BACKEND_LZ4HC
+ 
++config ZRAM_DEF_COMP_LZ4KD
++	bool "lz4kd"
++	depends on ZRAM_BACKEND_LZ4KD
++
++config ZRAM_DEF_COMP_LZ4KDS
++	bool "lz4kds"
++	depends on ZRAM_BACKEND_LZ4KDS
++
+ config ZRAM_DEF_COMP_ZSTD
+ 	bool "zstd"
+ 	depends on ZRAM_BACKEND_ZSTD
+@@ -99,6 +128,8 @@
+ 	default "lzo" if ZRAM_DEF_COMP_LZO
+ 	default "lz4" if ZRAM_DEF_COMP_LZ4
+ 	default "lz4hc" if ZRAM_DEF_COMP_LZ4HC
++	default "lz4kd" if ZRAM_DEF_COMP_LZ4KD
++	default "lz4kds" if ZRAM_DEF_COMP_LZ4KDS
+ 	default "zstd" if ZRAM_DEF_COMP_ZSTD
+ 	default "deflate" if ZRAM_DEF_COMP_DEFLATE
+ 	default "842" if ZRAM_DEF_COMP_842
+
+--- a/drivers/block/zram/Makefile
++++ b/drivers/block/zram/Makefile
+@@ -5,6 +5,8 @@
+ zram-$(CONFIG_ZRAM_BACKEND_LZO)		+= backend_lzorle.o backend_lzo.o
+ zram-$(CONFIG_ZRAM_BACKEND_LZ4)		+= backend_lz4.o
+ zram-$(CONFIG_ZRAM_BACKEND_LZ4HC)	+= backend_lz4hc.o
++zram-$(CONFIG_ZRAM_BACKEND_LZ4KD)	+= backend_lz4kd.o
++zram-$(CONFIG_ZRAM_BACKEND_LZ4KDS)	+= backend_lz4kd.o lz4kds_sddc.o
+ zram-$(CONFIG_ZRAM_BACKEND_ZSTD)	+= backend_zstd.o
+ zram-$(CONFIG_ZRAM_BACKEND_DEFLATE)	+= backend_deflate.o
+ zram-$(CONFIG_ZRAM_BACKEND_842)		+= backend_842.o
+
+--- a/drivers/block/zram/zcomp.c
++++ b/drivers/block/zram/zcomp.c
+@@ -19,6 +19,7 @@
+ #include "backend_zstd.h"
+ #include "backend_deflate.h"
+ #include "backend_842.h"
++#include "backend_lz4kd.h"
+ 
+ static const struct zcomp_ops *backends[] = {
+ #if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZO)
+@@ -40,6 +41,12 @@
+ #if IS_ENABLED(CONFIG_ZRAM_BACKEND_842)
+ 	&backend_842,
+ #endif
++#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4KD)
++	&backend_lz4kd,
++#endif
++#if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4KDS)
++	&backend_lz4kds,
++#endif
+ 	NULL
+ };
+ 
+
+--- a/drivers/block/zram/zcomp.h
++++ b/drivers/block/zram/zcomp.h
+@@ -57,6 +57,16 @@
+ 	int (*setup_params)(struct zcomp_params *params);
+ 	void (*release_params)(struct zcomp_params *params);
+ 
++	/*
++	 * Optional.  Called from zram_free_page() while the stored object is
++	 * still mapped, just before zsmalloc releases it.  Backends that keep
++	 * out-of-band state keyed by the object contents (LZ4KDS reference
++	 * accounting) use this to drop exactly one reference per object.
++	 * Backends that leave it NULL are unaffected.
++	 */
++	void (*release)(struct zcomp_params *params, const void *src,
++			unsigned int src_len);
++
+ 	const char *name;
+ };
+ 
+
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -1589,6 +1589,7 @@
+ static void zram_free_page(struct zram *zram, size_t index)
+ {
+ 	unsigned long handle;
++	u32 prio = zram_get_priority(zram, index);
+ 
+ #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
+ 	zram->table[index].ac_time = 0;
+@@ -1624,6 +1625,25 @@
+ 	if (!handle)
+ 		return;
+ 
++	/*
++	 * Let the compressor backend observe the payload one last time before
++	 * zsmalloc reclaims it.  LZ4KDS uses this to drop the reference held by
++	 * an alias/delta object; backends without the callback are unaffected.
++	 */
++	if (prio < ZRAM_MAX_COMPS && zram->comps[prio] &&
++	    zram->comps[prio]->ops->release) {
++		struct zcomp *comp = zram->comps[prio];
++		struct zcomp_strm *zstrm;
++		void *payload;
++
++		zstrm = zcomp_stream_get(comp);
++		payload = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
++		comp->ops->release(comp->params, payload,
++				   zram_get_obj_size(zram, index));
++		zs_unmap_object(zram->mem_pool, handle);
++		zcomp_stream_put(comp);
++	}
++
+ 	zs_free(zram->mem_pool, handle);
+ 
+ 	atomic64_sub(zram_get_obj_size(zram, index),

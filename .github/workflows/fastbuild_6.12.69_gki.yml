@@ -42,6 +42,11 @@ on:
         required: true
         type: boolean
         default: 'false'
+      lz4kds_enable:
+        description: '是否安装 LZ4KDS(LZ4KD+SDDC 相似页/差分压缩)并自行编译 zram.ko(需开启上面的 LZ4KD 补丁)'
+        required: true
+        type: boolean
+        default: 'false'
       bbr_enable:
         description: "是否启用bbr算法(优化上行数据,对手机日用无太大意义甚至可能负优化;false关闭,true仅加入算法,default启用算法并设为默认)"
         required: true
@@ -334,6 +339,17 @@ jobs:
           cd kernel_workspace/common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/lz4kd.patch
           patch -p1 -F 3 < lz4kd.patch || true
+
+      - name: 应用 LZ4KDS (LZ4KD + SDDC) 补丁
+        if: inputs.lz4kds_enable
+        run: |
+          echo "正在添加 LZ4KDS 补丁…"
+          cd kernel_workspace/common
+          BASE=https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lz4kds_patch
+          wget $BASE/001-zram-sddc-core.patch
+          wget $BASE/002-zram-sddc-files.patch
+          patch -p1 -F 3 < 001-zram-sddc-core.patch
+          patch -p1 -F 3 < 002-zram-sddc-files.patch
           
       - name: 添加SUSFS 配置项
         if: inputs.susfs_enable
@@ -376,6 +392,13 @@ jobs:
             echo "CONFIG_ZRAM_BACKEND_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_842=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
+          if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
+            # LZ4KDS 需要 LZ4KD 编解码与 zram 后端，且必须自行编译 zram.ko
+            echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_ZRAM_BACKEND_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_ZRAM_BACKEND_LZ4KDS=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_ZRAM=m" >> ./common/arch/arm64/configs/gki_defconfig
           fi
           # 开启O2编译优化配置
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -690,6 +713,32 @@ jobs:
           echo "编译后空间:"
           df -h
 
+      - name: 编译 zram.ko (LZ4KDS)
+        if: inputs.lz4kds_enable
+        run: |
+          echo "正在编译 zram.ko（含 LZ4KDS 后端）…"
+          cd kernel_workspace/common
+          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
+          export LIBCLANG_PATH="$WORKDIR/kernel_workspace/clang19/lib"
+          export LLVM=1 LLVM_IAS=1
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC="clang" LD="ld.lld" AR="llvm-ar" NM="llvm-nm" \
+                 OBJCOPY="llvm-objcopy" OBJDUMP="llvm-objdump" \
+                 READELF="llvm-readelf" STRIP="llvm-strip"
+          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error -fno-stack-protector"
+          # Reuse the .config produced by the Image build so the module's
+          # vermagic and configuration match the kernel exactly.
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
+               CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" \
+               modules_prepare || true
+          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
+               CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" \
+               OBJCOPY="llvm-objcopy" M=drivers/block/zram modules
+          ls -la out/drivers/block/zram/*.ko
+          mkdir -p "$GITHUB_WORKSPACE/zram_out"
+          cp out/drivers/block/zram/zram.ko "$GITHUB_WORKSPACE/zram_out/zram.ko"
+
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
@@ -735,6 +784,22 @@ jobs:
           if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
             wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
           fi
+          if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
+            # 用本次编译出的 zram.ko（含 LZ4KDS 后端）替换预编译版本
+            if [[ -f "$GITHUB_WORKSPACE/zram_out/zram.ko" ]]; then
+              rm -rf zram_mod && mkdir zram_mod
+              cd zram_mod
+              unzip -o ../zram.zip >/dev/null 2>&1 || true
+              cp "$GITHUB_WORKSPACE/zram_out/zram.ko" ./zram.ko
+              zip -r ../zram-lz4kds.zip ./* >/dev/null
+              cd ..
+              rm -f zram.zip
+              mv zram-lz4kds.zip zram.zip
+              echo "已用新编译的 zram.ko 替换预编译版本"
+            else
+              echo "警告：未找到新编译的 zram.ko，沿用预编译版本"
+            fi
+          fi
           if [[ ${{ github.event.inputs.kpm_enable }} == 'true' ]]; then
             wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip
           fi
@@ -768,6 +833,7 @@ jobs:
           echo "KPM: ${{ github.event.inputs.kpm_enable }}" >> ./ak3.log
           echo "LZ4: ${{ github.event.inputs.lz4_enable }}" >> ./ak3.log
           echo "LZ4KD: ${{ github.event.inputs.lz4kd_enable }}" >> ./ak3.log
+          echo "LZ4KDS: ${{ github.event.inputs.lz4kds_enable }}" >> ./ak3.log
           echo "IPset: ${{ github.event.inputs.better_net }}" >> ./ak3.log
           echo "BBR&Brutal: ${{ github.event.inputs.bbr_enable }}" >> ./ak3.log
           echo "Droidspaces: ${{ github.event.inputs.droidspaces_enable }}" >> ./ak3.log
@@ -852,6 +918,7 @@ jobs:
           - KPM支持 ：${{ github.event.inputs.kpm_enable }}
           - LZ4支持：${{ github.event.inputs.lz4_enable }}
           - LZ4KD支持：${{ github.event.inputs.lz4kd_enable }}
+          - LZ4KDS(LZ4KD+SDDC)支持：${{ github.event.inputs.lz4kds_enable }}
           - 网络功能增强：${{ github.event.inputs.better_net }}
           - BBR/Brutal 等拥塞控制算法支持：${{ github.event.inputs.bbr_enable }}
           - Droidspaces 容器支持：${{ github.event.inputs.droidspaces_enable }}
