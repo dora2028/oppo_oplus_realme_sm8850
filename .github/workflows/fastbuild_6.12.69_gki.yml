@@ -43,7 +43,7 @@ on:
         type: boolean
         default: 'false'
       lz4kds_enable:
-        description: '是否安装 LZ4KDS(LZ4KD+SDDC 相似页/差分压缩)并自行编译 zram.ko(需开启上面的 LZ4KD 补丁)'
+        description: '是否启用 LZ4KDS(LZ4KD+SDDC 相似页/差分压缩)，会把 zram 内置进内核(需开启上面的 LZ4KD 补丁)'
         required: true
         type: boolean
         default: 'false'
@@ -406,8 +406,11 @@ jobs:
             # 该组合下 backend_zstd.o 无法编译（官方预编译 zram.ko 同样不含
             # zstd，可佐证）。gki_defconfig 默认 ZRAM_BACKEND_ZSTD=y，须显式关闭。
             echo "# CONFIG_ZRAM_BACKEND_ZSTD is not set" >> ./common/arch/arm64/configs/gki_defconfig
-            # zram 保持模块形态（GKI 默认 CONFIG_ZRAM=m），由本流程自行编译 zram.ko
-            echo "CONFIG_ZRAM=m" >> ./common/arch/arm64/configs/gki_defconfig
+            # 把 zram 内置进内核（=y），无需外置 zram.ko。
+            # 这样 LZ4KDS 直接随 Image 生效，也避开单独编译模块时的
+            # modpost/Module.symvers 依赖问题。
+            echo "CONFIG_ZRAM=y" >> ./common/arch/arm64/configs/gki_defconfig
+            echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
           fi
           # 开启O2编译优化配置
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -722,123 +725,6 @@ jobs:
           echo "编译后空间:"
           df -h
 
-      - name: 编译 zram.ko (LZ4KDS)
-        if: inputs.lz4kds_enable
-        run: |
-          exec > >(tee -a "$GITHUB_WORKSPACE/zram_build.log") 2>&1
-          echo "正在编译 zram.ko（含 LZ4KDS 后端）…"
-          WORKDIR="$(pwd)"
-          # 与"构建内核"步骤完全相同的工具链 PATH 顺序
-          export PATH="/usr/lib/ccache:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/clang19/bin:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/rust/bin:$PATH"
-          export CLANG_DIR="$WORKDIR/kernel_workspace/clang19/bin"
-          export LIBCLANG_PATH="$WORKDIR/kernel_workspace/clang19/lib"
-          echo "clang: $($CLANG_DIR/clang --version | head -n1)"
-          echo "ld.lld: $($CLANG_DIR/ld.lld --version | head -n1)"
-
-          cd kernel_workspace/common
-          # 复用 Image 构建留下的 .config / auto.conf，保证 vermagic 一致
-          echo "=== out/ 关键产物诊断 ==="
-          ls -la out/.config 2>/dev/null || echo "missing out/.config"
-          ls -la out/include/config/auto.conf 2>/dev/null || echo "missing out/include/config/auto.conf"
-          ls -la out/include/generated/autoconf.h 2>/dev/null || echo "missing out/include/generated/autoconf.h"
-          ls -la out/Module.symvers 2>/dev/null || echo "missing out/Module.symvers"
-          ls -la out/vmlinux 2>/dev/null || echo "missing out/vmlinux"
-          if [[ ! -f out/.config ]]; then
-            echo "错误：未找到 out/.config"
-            exit 1
-          fi
-
-          export ARCH=arm64 SUBARCH=arm64
-          export LLVM=1 LLVM_IAS=1
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export HOSTCC=clang HOSTLD=ld.lld
-          export AR=llvm-ar NM=llvm-nm READELF=llvm-readelf
-          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
-          export KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error -fno-stack-protector"
-
-          # Image 已完整构建过，模块所需的准备步骤其实已完成；
-          # modules_prepare 在已有产物上可能因缺 vmlinux 报错，故容忍失败。
-          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- \
-               CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
-               modules_prepare || true
-          # 优先复用 Image 的 O=out 产物，使模块 vermagic 与内核完全一致。
-          # 若该路径因产物不全失败，则回退到不带 O= 的构建。
-          # 只编译 zram 需要的目标文件。
-          # 注意：上游 002-zstd.patch 把 zstd 升到 1.5.7 并改了 include/linux/
-          # zstd.h 的 API，但 backend_zstd.c 未同步更新，因此在该组合下
-          # backend_zstd.o 无法编译。这与 LZ4KDS 无关，这里显式跳过它。
-          # 目标文件集合与官方预编译 zram.ko 完全一致（8 个），再加上
-          # LZ4KDS 的 2 个新文件。官方同样不含 backend_zstd/deflate，
-          # 因为上游 002-zstd.patch 升级 zstd 后 backend_zstd.c 未同步。
-          # 注意：M=<绝对路径> 时目标文件必须写成相对该目录的路径，
-          # 否则 kbuild 会拼成 zram/drivers/block/zram/*.o。
-          ZRAM_OBJS="zcomp.o zram_drv.o \
-                     backend_lzo.o backend_lzorle.o \
-                     backend_lz4.o backend_lz4hc.o \
-                     backend_lz4kd.o backend_842.o \
-                     backend_lz4kds.o lz4kds_sddc.o"
-
-          set +e
-          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- \
-               CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
-               OBJCOPY=llvm-objcopy M="$PWD/drivers/block/zram" \
-               $ZRAM_OBJS
-          OBJRC=$?
-          set -e
-          if [[ $OBJRC -ne 0 ]]; then
-            echo "错误：zram 目标文件编译失败 (rc=$OBJRC)"
-            exit 1
-          fi
-
-          # 链接出 zram.ko。
-          # Image 构建不会生成 out/Module.symvers（只有 modules 目标才会），
-          # 因此 modpost 会因缺少符号表而报大量 undefined。这里用
-          # KBUILD_MODPOST_WARN=1 把它降级为警告：符号解析由运行时的
-          # 内核符号表完成，模块本身是完整的。
-          set +e
-          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- \
-               CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
-               OBJCOPY=llvm-objcopy KBUILD_MODPOST_WARN=1 \
-               M="$PWD/drivers/block/zram" modules
-          set -e
-          KO=out/drivers/block/zram/zram.ko
-          if [[ ! -f "$KO" ]]; then
-            echo "直接链接未产出 zram.ko，尝试常规 modules 构建（忽略 backend_zstd）…"
-            set +e
-            make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
-                 CROSS_COMPILE=aarch64-linux-gnu- \
-                 CC="$CLANG_DIR/clang" LD="$CLANG_DIR/ld.lld" \
-                 OBJCOPY=llvm-objcopy M="$PWD/drivers/block/zram" modules
-            set -e
-          fi
-          if [[ ! -f "$KO" ]]; then
-            echo "错误：zram.ko 未生成"
-            exit 1
-          fi
-          ls -la "$KO"
-          echo "=== zram.ko vermagic ==="
-          strings "$KO" | grep -i vermagic | head -2 || true
-          echo "=== 内置压缩算法 ==="
-          strings "$KO" | grep -E '^(lz4kd|lz4kds|lz4|lz4hc|zstd|lzo-rle|lzo)$' | sort -u || true
-          mkdir -p "$GITHUB_WORKSPACE/zram_out"
-          cp "$KO" "$GITHUB_WORKSPACE/zram_out/zram.ko"
-
-      - name: 上传 zram 编译日志
-        if: always() && inputs.lz4kds_enable
-        uses: actions/upload-artifact@v4
-        with:
-          name: zram-build-log
-          path: |
-            zram_build.log
-            zram_out/zram.ko
-          if-no-files-found: warn
-
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
@@ -881,24 +767,12 @@ jobs:
           else
             KSU_TYPENAME="none"
           fi
-          if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
-            wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
-          fi
+          # lz4kds 场景下 zram 已内置进内核（CONFIG_ZRAM=y），
+          # 不能再附带外置 zram.ko，否则会与内置驱动冲突。
           if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
-            # 用本次编译出的 zram.ko（含 LZ4KDS 后端）替换预编译版本
-            if [[ -f "$GITHUB_WORKSPACE/zram_out/zram.ko" ]]; then
-              rm -rf zram_mod && mkdir zram_mod
-              cd zram_mod
-              unzip -o ../zram.zip >/dev/null 2>&1 || true
-              cp "$GITHUB_WORKSPACE/zram_out/zram.ko" ./zram.ko
-              zip -r ../zram-lz4kds.zip ./* >/dev/null
-              cd ..
-              rm -f zram.zip
-              mv zram-lz4kds.zip zram.zip
-              echo "已用新编译的 zram.ko 替换预编译版本"
-            else
-              echo "警告：未找到新编译的 zram.ko，沿用预编译版本"
-            fi
+            echo "zram 已内置进内核，不打包 zram 模块"
+          elif [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
+            wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
           fi
           if [[ ${{ github.event.inputs.kpm_enable }} == 'true' ]]; then
             wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip

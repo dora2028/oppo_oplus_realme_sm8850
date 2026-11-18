@@ -1,27 +1,31 @@
-fix(ci): modpost 降级为警告，解决 zram.ko 链接阶段失败
+feat(lz4kds): 改为把 zram 内置进内核，不再依赖外置 zram.ko
 
-artifact 里的完整日志显示，zram 的所有目标文件都已编译通过，
-并且 zram.o 已成功链接：
+参考仓库 README 的"待实现"列表第一条就是"zram内置化，无需外置zram.ko挂载"，
+这也正是前几轮卡住的根因所在。
 
-  CC [M] zcomp.o / zram_drv.o / backend_lzo.o / backend_lzorle.o
-         backend_lz4.o / backend_lz4hc.o / backend_lz4kd.o
-         backend_842.o / backend_lz4kds.o / lz4kds_sddc.o
-  LD [M] drivers/block/zram/zram.o
-
-失败只发生在 modpost：
-
+问题
+前几轮 CI 在单独编译 zram.ko 时失败于 modpost：
   WARNING: ./Module.symvers is missing.
   ERROR: modpost: "sysfs_streq" [zram.ko] undefined!
-  ERROR: modpost: "vfree" [zram.ko] undefined!
-  ... (157 more suppressed)
+  ... (157 more)
+本流程只构建 Image，从不生成 out/Module.symvers；而
+CONFIG_MODVERSIONS=y 要求每个外部符号带 CRC，人工拼出来的符号表
+无法满足。官方预编译的 zram.ko 之所以能用，是因为它是在完整 modules
+构建环境里产出的。
 
-原因是本流程只构建 Image 目标，从不生成 out/Module.symvers；而
-modpost 需要它来校验模块的外部符号。这些符号在运行时由内核符号表
-解析，模块本身是完整的。
+方案
+CONFIG_ZRAM 本身是 tristate，直接设成 =y 内置进内核：
+- 代码层面无需改动：module_init 内置后自动成为 initcall，
+  THIS_MODULE / MODULE_* / module_param 在 =y 下都正常工作；
+- LZ4KDS 随 Image 一起生效，彻底不需要 zram.ko；
+- 顺带完成了 README 里列为待实现的"zram 内置化"。
 
-调整
-- 模块构建加 KBUILD_MODPOST_WARN=1，把未解析符号降级为警告，
-  让 zram.ko 正常产出。
+CI 调整
+- lz4kds_enable 分支写 CONFIG_ZRAM=y、CONFIG_ZSMALLOC=y。
+- 删除单独的 zram.ko 编译步骤与其日志 artifact 步骤。
+- lz4kds 构建不再附带 zram.zip（内置后安装外置 zram.ko 会与内置驱动
+  抢同一块设备与同名 sysfs）；lz4kd（非 lz4kds）路径保持原样。
+- 更新输入项描述，不再声称"自行编译 zram.ko"。
 
-说明：这一轮的编译产物已证明 LZ4KDS 的代码在真实 AOSP 6.12 树上
-可以正确编译并链接，backend_lz4kds.o 与 lz4kds_sddc.o 均无错误。
+此前已验证：LZ4KDS 的全部源码在真实 AOSP 6.12 树上编译无错误，
+zram.o 可成功链接。
