@@ -37,13 +37,8 @@ on:
         required: true
         type: boolean
         default: 'true'
-      lz4kd_enable:
-        description: '是否安装 LZ4KD 补丁(若已开启lz4+zstd补丁则可不开启)'
-        required: true
-        type: boolean
-        default: 'false'
       lz4kds_enable:
-        description: '是否启用 LZ4KDS(LZ4KD+SDDC 相似页/差分压缩)，会把 zram 内置进内核(需开启上面的 LZ4KD 补丁)'
+        description: '是否启用 LZ4KDS(LZ4KD+SDDC 相似页/差分压缩)。会自动引入 LZ4KD 编解码与 zram 后端，并把 zram 内置进内核'
         required: true
         type: boolean
         default: 'false'
@@ -333,12 +328,18 @@ jobs:
           patch -p1 -F 3 < 002-zstd.patch || true
 
       - name: 应用 lz4kd 补丁
-        if: inputs.lz4kd_enable
+        if: inputs.lz4kds_enable
         run: |
-          echo "正在添加lz4kd补丁…"
+          echo "正在添加 lz4kd 补丁（LZ4KDS 的编解码依赖）…"
           cd kernel_workspace/common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/lz4kd.patch
-          patch -p1 -F 3 < lz4kd.patch || true
+          # LZ4KDS 的 Kconfig 依赖 ZRAM_BACKEND_LZ4KD，并需要 include/linux/lz4kd.h
+          # 与 lib/lz4kd/ 编解码实现，这些全部由本补丁提供。
+          patch -p1 -F 3 < lz4kd.patch
+          test -f include/linux/lz4kd.h || { echo "错误：lz4kd 补丁未提供 include/linux/lz4kd.h"; exit 1; }
+          test -d lib/lz4kd || { echo "错误：lz4kd 补丁未提供 lib/lz4kd/"; exit 1; }
+          grep -q 'config ZRAM_BACKEND_LZ4KD$' drivers/block/zram/Kconfig \
+            || { echo "错误：lz4kd 补丁未注册 ZRAM_BACKEND_LZ4KD"; exit 1; }
 
       - name: 应用 LZ4KDS (LZ4KD + SDDC) 补丁
         if: inputs.lz4kds_enable
@@ -385,30 +386,21 @@ jobs:
           # 添加对 Mountify (backslashxx/mountify) 模块的支持
           echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          if [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
-            echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
+          if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
+            # LZ4KDS = LZ4KD 编解码 + SDDC 差分，二者一起编进内核。
             echo "CONFIG_CRYPTO_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_CRYPTO_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
-            #以下配置选项用于编译zram模块，开启与否不影响内核编译
             echo "CONFIG_ZRAM_BACKEND_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_842=y" >> ./common/arch/arm64/configs/gki_defconfig
-          fi
-          if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
-            # LZ4KDS 依赖 LZ4KD 编解码，并需要 zram 后端参与编译
-            echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZRAM_BACKEND_LZ4KDS=y" >> ./common/arch/arm64/configs/gki_defconfig
-            # 关闭 zstd 后端：上游 002-zstd.patch 把 zstd 升到 1.5.7 并替换了
-            # include/linux/zstd.h 的 API，但 backend_zstd.c 未同步更新，
-            # 该组合下 backend_zstd.o 无法编译（官方预编译 zram.ko 同样不含
-            # zstd，可佐证）。gki_defconfig 默认 ZRAM_BACKEND_ZSTD=y，须显式关闭。
+            # 关闭 zstd 后端：上游 002-zstd.patch 升级 zstd 后，backend_zstd.c
+            # 依赖的 dictionary/advanced API 未被新版 zstd.h 提供，无法编译。
             echo "# CONFIG_ZRAM_BACKEND_ZSTD is not set" >> ./common/arch/arm64/configs/gki_defconfig
-            # 把 zram 内置进内核（=y），无需外置 zram.ko。
-            # 这样 LZ4KDS 直接随 Image 生效，也避开单独编译模块时的
-            # modpost/Module.symvers 依赖问题。
+            # zram 内置进内核（=y）：LZ4KDS 随 Image 直接生效，无需外置 zram.ko
             echo "CONFIG_ZRAM=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
           fi
@@ -767,12 +759,29 @@ jobs:
           else
             KSU_TYPENAME="none"
           fi
-          # lz4kds 场景下 zram 已内置进内核（CONFIG_ZRAM=y），
-          # 不能再附带外置 zram.ko，否则会与内置驱动冲突。
+          # 附带 ZRAM 算法切换模块。
+          # zram 已内置进内核（CONFIG_ZRAM=y），因此模块只保留交互菜单
+          # （action.sh / service.sh），剔除 zram.ko 与 rmmod/insmod 逻辑，
+          # 避免与内置驱动冲突。
           if [[ "${{ github.event.inputs.lz4kds_enable }}" == "true" ]]; then
-            echo "zram 已内置进内核，不打包 zram 模块"
-          elif [[ "${{ github.event.inputs.lz4kd_enable }}" == "true" ]]; then
             wget https://raw.githubusercontent.com/$GITHUB_REPOSITORY/refs/heads/$GITHUB_REF_NAME/zram.zip
+            rm -rf zram_switch && mkdir zram_switch
+            cd zram_switch
+            unzip -o ../zram.zip >/dev/null 2>&1 || true
+            rm -f zram.ko
+            # 去掉开机脚本里的 rmmod/insmod：zram 已内置，卸载会失败
+            if [[ -f service.sh ]]; then
+              sed -i '/rmmod zram/d; /insmod .*zram.ko/d' service.sh
+            fi
+            # 算法列表对齐实际可用后端（当前内核无 zstd 后端）
+            if [[ -f action.sh ]]; then
+              sed -i 's/algorithms="lz4 zstd lzo lzo-rle lz4k lz4hc lz4kd 842 zstdn"/algorithms="lz4kds lz4kd lz4k lz4hc lz4 lzo-rle lzo 842 deflate"/' action.sh
+            fi
+            zip -r ../zram-switch.zip ./* >/dev/null
+            cd ..
+            rm -rf zram_switch zram.zip
+            mv zram-switch.zip zram.zip
+            echo "已打包 ZRAM 算法切换模块（内置 zram 版，不含 zram.ko）"
           fi
           if [[ ${{ github.event.inputs.kpm_enable }} == 'true' ]]; then
             wget https://github.com/cctv18/KPatch-Next/releases/latest/download/kpn.zip
@@ -806,7 +815,6 @@ jobs:
           echo "susfs: ${{ github.event.inputs.susfs_enable }}" >> ./ak3.log
           echo "KPM: ${{ github.event.inputs.kpm_enable }}" >> ./ak3.log
           echo "LZ4: ${{ github.event.inputs.lz4_enable }}" >> ./ak3.log
-          echo "LZ4KD: ${{ github.event.inputs.lz4kd_enable }}" >> ./ak3.log
           echo "LZ4KDS: ${{ github.event.inputs.lz4kds_enable }}" >> ./ak3.log
           echo "IPset: ${{ github.event.inputs.better_net }}" >> ./ak3.log
           echo "BBR&Brutal: ${{ github.event.inputs.bbr_enable }}" >> ./ak3.log
@@ -891,8 +899,7 @@ jobs:
           - susfs支持：${{ github.event.inputs.susfs_enable }}
           - KPM支持 ：${{ github.event.inputs.kpm_enable }}
           - LZ4支持：${{ github.event.inputs.lz4_enable }}
-          - LZ4KD支持：${{ github.event.inputs.lz4kd_enable }}
-          - LZ4KDS(LZ4KD+SDDC)支持：${{ github.event.inputs.lz4kds_enable }}
+          - LZ4KDS(LZ4KD+SDDC)支持：${{ github.event.inputs.lz4kds_enable }}（zram 内置进内核）
           - 网络功能增强：${{ github.event.inputs.better_net }}
           - BBR/Brutal 等拥塞控制算法支持：${{ github.event.inputs.bbr_enable }}
           - Droidspaces 容器支持：${{ github.event.inputs.droidspaces_enable }}
