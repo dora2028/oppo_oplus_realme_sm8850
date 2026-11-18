@@ -94,23 +94,15 @@
 
 --- a/drivers/block/zram/zram_drv.c
 +++ b/drivers/block/zram/zram_drv.c
-@@ -36,6 +36,15 @@
+@@ -36,6 +36,7 @@
  #include <linux/kernel_read_file.h>
  
  #include "zram_drv.h"
 +
-+/* verification stubs: Android-only symbols absent on vanilla 6.12 */
-+#ifndef __GFP_CMA
-+#define __GFP_CMA 0
-+#endif
-+static inline struct file *filp_open_block(const char *n, int f, umode_t m)
-+{ return filp_open(n, f, m); }
-+static inline int read_comp_algo_dictionary(void **d, const char *p) { return 0; }
-+
  #include "zram_ioctl.h"
  
  static DEFINE_IDR(zram_index_idr);
-@@ -1589,6 +1598,7 @@
+@@ -1589,6 +1590,7 @@
  static void zram_free_page(struct zram *zram, size_t index)
  {
  	unsigned long handle;
@@ -118,7 +110,7 @@
  
  #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
  	zram->table[index].ac_time = 0;
-@@ -1624,6 +1634,25 @@
+@@ -1624,6 +1626,25 @@
  	if (!handle)
  		return;
  
