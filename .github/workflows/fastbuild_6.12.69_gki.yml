@@ -720,6 +720,7 @@ jobs:
       - name: 编译 zram.ko (LZ4KDS)
         if: inputs.lz4kds_enable
         run: |
+          exec > >(tee -a "$GITHUB_WORKSPACE/zram_build.log") 2>&1
           echo "正在编译 zram.ko（含 LZ4KDS 后端）…"
           WORKDIR="$(pwd)"
           # 与"构建内核"步骤完全相同的工具链 PATH 顺序
@@ -768,16 +769,13 @@ jobs:
           # 目标文件集合与官方预编译 zram.ko 完全一致（8 个），再加上
           # LZ4KDS 的 2 个新文件。官方同样不含 backend_zstd/deflate，
           # 因为上游 002-zstd.patch 升级 zstd 后 backend_zstd.c 未同步。
-          ZRAM_OBJS="drivers/block/zram/zcomp.o \
-                     drivers/block/zram/zram_drv.o \
-                     drivers/block/zram/backend_lzo.o \
-                     drivers/block/zram/backend_lzorle.o \
-                     drivers/block/zram/backend_lz4.o \
-                     drivers/block/zram/backend_lz4hc.o \
-                     drivers/block/zram/backend_lz4kd.o \
-                     drivers/block/zram/backend_842.o \
-                     drivers/block/zram/backend_lz4kds.o \
-                     drivers/block/zram/lz4kds_sddc.o"
+          # 注意：M=<绝对路径> 时目标文件必须写成相对该目录的路径，
+          # 否则 kbuild 会拼成 zram/drivers/block/zram/*.o。
+          ZRAM_OBJS="zcomp.o zram_drv.o \
+                     backend_lzo.o backend_lzorle.o \
+                     backend_lz4.o backend_lz4hc.o \
+                     backend_lz4kd.o backend_842.o \
+                     backend_lz4kds.o lz4kds_sddc.o"
 
           set +e
           make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 \
@@ -823,6 +821,16 @@ jobs:
           strings "$KO" | grep -E '^(lz4kd|lz4kds|lz4|lz4hc|zstd|lzo-rle|lzo)$' | sort -u || true
           mkdir -p "$GITHUB_WORKSPACE/zram_out"
           cp "$KO" "$GITHUB_WORKSPACE/zram_out/zram.ko"
+
+      - name: 上传 zram 编译日志
+        if: always() && inputs.lz4kds_enable
+        uses: actions/upload-artifact@v4
+        with:
+          name: zram-build-log
+          path: |
+            zram_build.log
+            zram_out/zram.ko
+          if-no-files-found: warn
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
